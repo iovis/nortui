@@ -62,6 +62,18 @@ elif name == "sudo":
 elif name == "nordvpn":
     assert (root / "service").read_text() == "active", "queried a stopped daemon"
     if args[0] == "status":
+        telemetry = bool(os.environ.get("NORTUI_TELEMETRY"))
+        sample = 0
+        def status_event(phase):
+            fd = os.open(root / "status-events.jsonl", os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+            os.write(fd, (json.dumps({"phase": phase, "sample": sample, "pid": os.getpid(), "time": time.monotonic()}) + "\n").encode())
+            os.close(fd)
+        if telemetry:
+            counter = root / "status-count"
+            sample = int(counter.read_text()) + 1 if counter.exists() else 1
+            counter.write_text(str(sample))
+            status_event("start")
+        time.sleep(float(os.environ.get("NORTUI_VPN_STATUS_DELAY", "0")))
         if (root / "status-failure").exists():
             print("Temporary VPN status failure", file=sys.stderr)
             sys.exit(1)
@@ -70,6 +82,12 @@ elif name == "nordvpn":
         if state == "Connected":
             city = (root / "vpn-city").read_text() if (root / "vpn-city").exists() else "New York"
             print(f"Country: United States\nCity: {city}\nIP: 192.0.2.10\nCurrent technology: NORDLYNX")
+            if telemetry:
+                print("Server: United States #8373\nCurrent protocol: UDP")
+                print(f"Uptime: 4 minutes {9 + sample} seconds")
+                print(f"Transfer: {98.94 + sample * 0.01:.2f} MiB received, {15.95 + sample * 0.01:.2f} MiB sent")
+        if telemetry:
+            status_event("end")
     elif args[0] == "countries":
         print("United_States\nJapan\nMonaco")
     elif args[0] == "cities":
@@ -247,6 +265,10 @@ class Widget:
     def location_commands(self):
         return [command for command in self.commands() if command[0] == "nordvpn" and command[1] in ("countries", "cities")]
 
+    def status_events(self):
+        path = self.root / "status-events.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
     def close(self):
         if self.process.poll() is None:
             if self.master is not None:
@@ -273,6 +295,50 @@ class TerminalSmoke(unittest.TestCase):
         widget = Widget(**kwargs)
         self.addCleanup(widget.close)
         return widget
+
+    def test_connected_telemetry_updates_each_second_without_layout_or_footer_activity(self):
+        widget = self.widget(service="active", vpn="Connected", cached=True, width=80, height=14, NORTUI_TELEMETRY="1")
+        widget.wait_for(lambda: "New York" in widget.text())
+        first_body = widget.body()
+        first_raw_end = len(widget.raw)
+        widget.wait_for(lambda: len([event for event in widget.status_events() if event["phase"] == "end"]) >= 2, timeout=1.75)
+        widget.wait_for(lambda: "04:11" in widget.text(), timeout=0.5)
+        self.assertIn("Server      United States #8373", widget.text())
+        self.assertIn("Technology  NORDLYNX · UDP", widget.text())
+        self.assertIn("↓ 98.96 MiB", widget.text())
+        self.assertIn("↑ 15.97 MiB", widget.text())
+        dynamic_rows = [index for index, row in enumerate(first_body) if "Uptime" in row or "Transfer" in row]
+        self.assertEqual(len(dynamic_rows), 2)
+        for index, row in enumerate(first_body):
+            if index not in dynamic_rows:
+                self.assertEqual(widget.body()[index], row)
+        self.assertNotEqual(widget.body(), first_body)
+        self.assertEqual(widget.footer().strip(), "● Connected")
+        self.assertFalse(any(frame.encode() in widget.raw[first_raw_end:] for frame in SPINNER_FRAMES))
+        starts = [event["time"] for event in widget.status_events() if event["phase"] == "start"]
+        self.assertGreaterEqual(starts[1] - starts[0], 0.85)
+        self.assertLess(starts[1] - starts[0], 1.75)
+        self.assertEqual(widget.location_commands(), [])
+        self.assertFalse(any(command[0] == "sudo" for command in widget.commands()))
+
+    def test_connected_slow_status_reads_never_overlap(self):
+        widget = self.widget(service="active", vpn="Connected", cached=True, NORTUI_TELEMETRY="1", NORTUI_VPN_STATUS_DELAY="1.35")
+        widget.wait_for(lambda: "04:10" in widget.text())
+        widget.wait_for(lambda: "04:11" in widget.text())
+        events = widget.status_events()
+        self.assertEqual([event["phase"] for event in events[:4]], ["start", "end", "start", "end"])
+        active = None
+        for event in events:
+            if event["phase"] == "start":
+                self.assertIsNone(active, "Status requests overlapped")
+                active = event["pid"]
+            else:
+                self.assertEqual(active, event["pid"])
+                active = None
+        self.assertGreaterEqual(events[1]["time"] - events[0]["time"], 1.3)
+        self.assertGreaterEqual(events[2]["time"], events[1]["time"])
+        self.assertEqual(widget.footer().strip(), "● Connected")
+        self.assertEqual(widget.location_commands(), [])
 
     def test_initial_status_check_uses_only_footer_progress(self):
         widget = self.widget(cached=True, NORTUI_STATUS_DELAY="0.6")

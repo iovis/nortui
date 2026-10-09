@@ -452,10 +452,91 @@ pub fn parse_status(output: &str) -> VpnStatus {
         country: field("Country").map(str::to_owned),
         city: field("City").map(str::to_owned),
         ip: field("IP").map(str::to_owned),
+        server: field("Server")
+            .or_else(|| field("Current server"))
+            .or_else(|| field("Hostname"))
+            .map(str::to_owned),
         technology: field("Current technology")
             .or_else(|| field("Technology"))
             .map(str::to_owned),
+        protocol: field("Current protocol")
+            .or_else(|| field("Protocol"))
+            .map(str::to_owned),
+        uptime: field("Uptime").and_then(parse_uptime),
+        received: field("Transfer").and_then(|value| parse_transferred(value, "received")),
+        sent: field("Transfer").and_then(|value| parse_transferred(value, "sent")),
     }
+}
+
+fn parse_transferred(input: &str, direction: &str) -> Option<String> {
+    let mut amounts = input.split(',').filter_map(|clause| {
+        let mut words = clause.split_whitespace();
+        let amount = words.next()?;
+        let unit = words.next()?;
+        let label = words.next()?;
+        if words.next().is_some() || !label.eq_ignore_ascii_case(direction) {
+            return None;
+        }
+        let mut parts = amount.split('.');
+        let integer = parts.next()?;
+        let fraction = parts.next();
+        let digits =
+            |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+        if !digits(integer)
+            || fraction.is_some_and(|part| !digits(part))
+            || parts.next().is_some()
+            || !matches!(
+                unit.to_ascii_lowercase().as_str(),
+                "b" | "byte"
+                    | "bytes"
+                    | "kb"
+                    | "mb"
+                    | "gb"
+                    | "tb"
+                    | "pb"
+                    | "eb"
+                    | "kib"
+                    | "mib"
+                    | "gib"
+                    | "tib"
+                    | "pib"
+                    | "eib"
+            )
+        {
+            return None;
+        }
+        Some(format!("{amount} {unit}"))
+    });
+    let amount = amounts.next()?;
+    // A duplicated direction is ambiguous instead of a trustworthy cumulative total.
+    if amounts.next().is_some() {
+        return None;
+    }
+    Some(amount)
+}
+
+fn parse_uptime(input: &str) -> Option<Duration> {
+    let mut words = input.split_whitespace();
+    let mut seconds = 0_u64;
+    let mut seen = false;
+    while let Some(value) = words.next() {
+        if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let value: u64 = value.parse().ok()?;
+        let unit = words.next()?;
+        let multiplier = match unit.to_ascii_lowercase().as_str() {
+            "second" | "seconds" => 1,
+            "minute" | "minutes" => 60,
+            "hour" | "hours" => 3_600,
+            "day" | "days" => 86_400,
+            "week" | "weeks" => 604_800,
+            _ => return None,
+        };
+        seconds = seconds.checked_add(value.checked_mul(multiplier)?)?;
+        seen = true;
+    }
+    seen.then(|| Duration::from_secs(seconds))
 }
 
 pub fn parse_locations(output: &str) -> Result<Vec<String>> {
@@ -671,6 +752,119 @@ esac
             ("Paused", VpnState::Paused),
         ] {
             assert_eq!(parse_status(&format!("Status: {label}\n")).state, state);
+        }
+    }
+
+    #[test]
+    fn parses_connected_session_details_from_complete_status() {
+        let status = parse_status(
+            "Status: Connected\nServer: United States #8373\nHostname: us8373.nordvpn.com\nIP: 203.0.113.10\nCountry: United States\nCity: New York\nCurrent technology: NORDLYNX\nCurrent protocol: UDP\nPost-quantum VPN: Disabled\nTransfer: 98.95 MiB received, 15.96 MiB sent\nUptime: 4 minutes 10 seconds\n",
+        );
+        assert_eq!(status.state, VpnState::Connected);
+        assert_eq!(status.server.as_deref(), Some("United States #8373"));
+        assert_eq!(status.protocol.as_deref(), Some("UDP"));
+        assert_eq!(status.uptime, Some(Duration::from_secs(250)));
+        assert_eq!(status.received.as_deref(), Some("98.95 MiB"));
+        assert_eq!(status.sent.as_deref(), Some("15.96 MiB"));
+    }
+
+    #[test]
+    fn older_aliases_and_empty_primary_fields_use_available_session_details() {
+        let status = parse_status(
+            "Status: Connected\nServer: \nCurrent server: Germany #42\nHostname: de42.nordvpn.com\nCurrent technology: \nTechnology: OpenVPN\nCurrent protocol: \nProtocol: TCP\n",
+        );
+        assert_eq!(status.server.as_deref(), Some("Germany #42"));
+        assert_eq!(status.technology.as_deref(), Some("OpenVPN"));
+        assert_eq!(status.protocol.as_deref(), Some("TCP"));
+        assert_eq!(status.uptime, None);
+        assert_eq!(status.received, None);
+        assert_eq!(status.sent, None);
+
+        let hostname = parse_status("Status: Connected\nHostname: us8373.nordvpn.com\n");
+        assert_eq!(hostname.server.as_deref(), Some("us8373.nordvpn.com"));
+        let preferred = parse_status(
+            "Status: Connected\nServer: United States #8373\nCurrent server: Germany #42\nCurrent protocol: UDP\nProtocol: TCP\n",
+        );
+        assert_eq!(preferred.server.as_deref(), Some("United States #8373"));
+        assert_eq!(preferred.protocol.as_deref(), Some("UDP"));
+    }
+
+    #[test]
+    fn malformed_or_missing_optional_telemetry_keeps_recognizable_vpn_state() {
+        for telemetry in [
+            "",
+            "Uptime: unknown\nTransfer: unavailable\n",
+            "Uptime: 5\nTransfer: -1 MiB received, NaN MiB sent\n",
+            "Uptime: 1.5 minutes\nTransfer: 42 MiB/s received, 12. MiB sent\n",
+            "Uptime: +5 seconds\nTransfer: 1..2 KiB received, .5 B sent\n",
+            "Uptime: 1 second garbage\nTransfer: 1 MiB received per second, 3 parsecs sent\n",
+        ] {
+            let status = parse_status(&format!("Status: Connected\n{telemetry}"));
+            assert_eq!(status.state, VpnState::Connected, "{telemetry}");
+            assert_eq!(status.uptime, None, "{telemetry}");
+            assert_eq!(status.received, None, "{telemetry}");
+            assert_eq!(status.sent, None, "{telemetry}");
+        }
+        let unavailable = VpnStatus::unavailable("offline");
+        assert_eq!(unavailable.server, None);
+        assert_eq!(unavailable.protocol, None);
+        assert_eq!(unavailable.uptime, None);
+        assert_eq!(unavailable.received, None);
+        assert_eq!(unavailable.sent, None);
+    }
+
+    #[test]
+    fn transfer_totals_are_tagged_independently_and_preserve_display_units() {
+        let reversed = parse_status(
+            "Status: Connected\nTransfer: 0 B sent, 0.00 KiB received\nUptime: 0 seconds\n",
+        );
+        assert_eq!(reversed.received.as_deref(), Some("0.00 KiB"));
+        assert_eq!(reversed.sent.as_deref(), Some("0 B"));
+        assert_eq!(reversed.uptime, Some(Duration::ZERO));
+
+        let partial = parse_status("Status: Connected\nTransfer: 3.50 GB RECEIVED, bad MiB sent\n");
+        assert_eq!(partial.received.as_deref(), Some("3.50 GB"));
+        assert_eq!(partial.sent, None);
+        let duplicated = parse_status(
+            "Status: Connected\nTransfer: 1 MiB received, 2 MiB received, 4 bytes sent\n",
+        );
+        assert_eq!(duplicated.received, None);
+        assert_eq!(duplicated.sent.as_deref(), Some("4 bytes"));
+        let sent_only = parse_status("Status: Connected\nTransfer: 1 byte sent\n");
+        assert_eq!(sent_only.received, None);
+        assert_eq!(sent_only.sent.as_deref(), Some("1 byte"));
+    }
+
+    #[test]
+    fn uptime_accepts_human_units_and_checks_duration_boundaries() {
+        for (text, seconds) in [
+            ("1 second", 1),
+            ("60 seconds", 60),
+            ("59 minutes 59 seconds", 3_599),
+            ("1 hour", 3_600),
+            ("1 day 1 hour 1 minute 1 second", 90_061),
+            ("2 weeks 3 days 4 hours 5 minutes 6 seconds", 1_483_506),
+            ("  1 WEEK  1 DAY  ", 691_200),
+            ("18446744073709551615 seconds", u64::MAX),
+        ] {
+            assert_eq!(
+                parse_uptime(text),
+                Some(Duration::from_secs(seconds)),
+                "{text}"
+            );
+        }
+        for text in [
+            "",
+            "seconds",
+            "1 fortnight",
+            "1 second 2",
+            "1.1 seconds",
+            "-1 seconds",
+            "18446744073709551616 seconds",
+            "18446744073709551615 minutes",
+            "18446744073709551615 seconds 1 second",
+        ] {
+            assert_eq!(parse_uptime(text), None, "{text}");
         }
     }
 

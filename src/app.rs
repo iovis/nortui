@@ -29,6 +29,7 @@ use crate::model::{Action, Location, ServiceState, Snapshot, VpnState};
 use crate::ui;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+const CONNECTED_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const REFRESH_NOTICE: &str = "Refreshing status…";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -660,9 +661,24 @@ impl Controller {
         }));
     }
 
+    fn poll_interval(&self) -> Duration {
+        if self.app.snapshot.service == ServiceState::Active
+            && self
+                .app
+                .snapshot
+                .vpn
+                .as_ref()
+                .is_some_and(|vpn| vpn.state == VpnState::Connected)
+        {
+            CONNECTED_POLL_INTERVAL
+        } else {
+            POLL_INTERVAL
+        }
+    }
+
     fn tick(&mut self) {
         self.app.expire_notice();
-        if self.last_poll.elapsed() >= POLL_INTERVAL
+        if self.last_poll.elapsed() >= self.poll_interval()
             && self.status_job.as_ref().is_none_or(JoinHandle::is_finished)
         {
             self.spawn_status();
@@ -1287,6 +1303,11 @@ mod tests {
                 city: None,
                 ip: None,
                 technology: None,
+                server: None,
+                protocol: None,
+                uptime: None,
+                received: None,
+                sent: None,
             }),
         });
         assert_eq!(
@@ -1547,6 +1568,11 @@ mod tests {
                 city: None,
                 ip: None,
                 technology: None,
+                server: None,
+                protocol: None,
+                uptime: None,
+                received: None,
+                sent: None,
             }),
         };
         app.set_snapshot(ready.clone());
@@ -1652,6 +1678,11 @@ mod tests {
                 city: Some("New_York".into()),
                 ip: Some("192.0.2.10".into()),
                 technology: Some("NORDLYNX".into()),
+                server: None,
+                protocol: None,
+                uptime: None,
+                received: None,
+                sent: None,
             }),
         });
         assert_eq!(app.status_text(), "Connected");
@@ -1659,6 +1690,31 @@ mod tests {
         assert_eq!(app.status_text(), "Connected");
         app.snapshot.service = ServiceState::Inactive;
         assert_eq!(app.status_text(), "Service stopped");
+    }
+
+    #[test]
+    fn status_polling_uses_one_second_only_for_the_observed_connected_state() {
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let mut controller = Controller::new(Backend::new(), runtime.handle().clone());
+        assert_eq!(controller.poll_interval(), Duration::from_secs(2));
+        for (state, seconds) in [
+            ("Connected", 1),
+            ("Connecting", 2),
+            ("Paused", 2),
+            ("Disconnected", 2),
+            ("Unrecognized", 2),
+        ] {
+            controller.app.set_snapshot(Snapshot {
+                service: ServiceState::Active,
+                vpn: Some(crate::backend::parse_status(&format!("Status: {state}\n"))),
+            });
+            assert_eq!(controller.poll_interval(), Duration::from_secs(seconds));
+        }
+        controller.app.set_snapshot(Snapshot {
+            service: ServiceState::Inactive,
+            vpn: Some(crate::backend::parse_status("Status: Connected\n")),
+        });
+        assert_eq!(controller.poll_interval(), Duration::from_secs(2));
     }
 
     #[test]

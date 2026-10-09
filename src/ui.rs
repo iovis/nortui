@@ -1,5 +1,5 @@
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -141,21 +141,66 @@ fn connection_lines(vpn: &VpnStatus, width: u16) -> Vec<Line<'static>> {
             Style::default().fg(GRAY),
         ));
     }
+    let technology = match (
+        nonempty(vpn.technology.as_deref()),
+        nonempty(vpn.protocol.as_deref()),
+    ) {
+        (Some(technology), Some(protocol)) => Some(format!("{technology} · {protocol}")),
+        (Some(value), None) | (None, Some(value)) => Some(value.to_owned()),
+        (None, None) => None,
+    };
+    let transfer = match (
+        nonempty(vpn.received.as_deref()),
+        nonempty(vpn.sent.as_deref()),
+    ) {
+        (Some(received), Some(sent)) => Some(format!("↓ {received}   ↑ {sent}")),
+        (Some(received), None) => Some(format!("↓ {received}")),
+        (None, Some(sent)) => Some(format!("↑ {sent}")),
+        (None, None) => None,
+    };
+    let session = vpn.state == VpnState::Connected && (vpn.uptime.is_some() || transfer.is_some());
     let metadata: Vec<_> = [
-        ("VPN IP", vpn.ip.as_deref()),
-        ("Technology", vpn.technology.as_deref()),
+        ("VPN IP", nonempty(vpn.ip.as_deref())),
+        ("Server", nonempty(vpn.server.as_deref())),
+        ("Technology", technology.as_deref()),
     ]
     .into_iter()
-    .filter_map(|(label, value)| {
-        let value = value?.trim();
-        (!value.is_empty()).then(|| metadata_line(label, value, width))
+    .filter_map(|(label, value)| match value {
+        Some(value) => Some(metadata_line(label, value, width)),
+        None if session => Some(Line::default()),
+        None => None,
     })
     .collect();
     if !metadata.is_empty() {
         lines.push(Line::default());
         lines.extend(metadata);
     }
+    if session {
+        lines.push(Line::default());
+        lines.push(vpn.uptime.map_or_else(Line::default, |duration| {
+            metadata_line("Uptime", &format_uptime(duration), width)
+        }));
+        lines.push(transfer.as_deref().map_or_else(Line::default, |value| {
+            metadata_line("Transfer", value, width)
+        }));
+    }
     lines
+}
+
+fn nonempty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn format_uptime(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    let hours = seconds / 3_600;
+    let minutes = seconds / 60 % 60;
+    let seconds = seconds % 60;
+    if hours == 0 {
+        format!("{minutes:02}:{seconds:02}")
+    } else {
+        format!("{hours:02}:{minutes:02}:{seconds:02}")
+    }
 }
 
 fn readable(value: Option<&str>) -> Option<String> {
@@ -612,8 +657,24 @@ mod tests {
                 city: Some("New_York".into()),
                 ip: Some("192.0.2.100".into()),
                 technology: Some("NORDLYNX".into()),
+                server: None,
+                protocol: None,
+                uptime: None,
+                received: None,
+                sent: None,
             }),
         }
+    }
+
+    fn connected_with_session() -> Snapshot {
+        let mut snapshot = connected();
+        let vpn = snapshot.vpn.as_mut().unwrap();
+        vpn.server = Some("United States #8373".into());
+        vpn.protocol = Some("UDP".into());
+        vpn.uptime = Some(Duration::from_secs(250));
+        vpn.received = Some("98.95 MiB".into());
+        vpn.sent = Some("15.96 MiB".into());
+        snapshot
     }
 
     fn country() -> Location {
@@ -662,6 +723,212 @@ mod tests {
         ] {
             assert!(!text(&terminal).contains(unwanted));
         }
+    }
+
+    #[test]
+    fn connected_session_fits_widget_and_keeps_statistics_secondary() {
+        let mut app = App::new(Vec::new());
+        app.set_snapshot(connected_with_session());
+        let terminal = terminal(&mut app, 80, 12);
+        for (row, expected) in [
+            (1, "  New York"),
+            (2, "  United States"),
+            (3, ""),
+            (4, "  VPN IP      192.0.2.100"),
+            (5, "  Server      United States #8373"),
+            (6, "  Technology  NORDLYNX · UDP"),
+            (7, ""),
+            (8, "  Uptime      04:10"),
+            (9, "  Transfer    ↓ 98.95 MiB   ↑ 15.96 MiB"),
+        ] {
+            assert_eq!(row_text(&terminal, row).trim_end(), expected);
+        }
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(2, 1)].fg, BLUE);
+        assert!(buffer[(2, 1)].modifier.contains(Modifier::BOLD));
+        for row in [4, 5, 6, 8, 9] {
+            assert_eq!(buffer[(2, row)].fg, GRAY);
+            assert_eq!(buffer[(14, row)].fg, TEXT);
+        }
+        assert!(buffer.content().iter().all(|cell| cell.bg == Color::Reset));
+        assert!(row_text(&terminal, 10).starts_with('─'));
+        assert!(row_text(&terminal, 11).ends_with("● Connected "));
+        assert!(row_text(&terminal, 11)[..66].trim().is_empty());
+        assert!(!terminal.backend().cursor_visible());
+    }
+
+    #[test]
+    fn session_clock_changes_format_at_an_hour_and_keeps_total_hours() {
+        for (seconds, expected) in [
+            (0, "00:00"),
+            (14, "00:14"),
+            (250, "04:10"),
+            (3_599, "59:59"),
+            (3_600, "01:00:00"),
+            (3_661, "01:01:01"),
+            (86_400, "24:00:00"),
+            (90_061, "25:01:01"),
+        ] {
+            assert_eq!(format_uptime(Duration::from_secs(seconds)), expected);
+        }
+    }
+
+    #[test]
+    fn missing_session_fields_reserve_rows_without_inventing_values() {
+        let mut app = App::new(Vec::new());
+        app.set_snapshot(connected_with_session());
+        let mut terminal = terminal(&mut app, 80, 12);
+        for (uptime, received, sent, expected_uptime, expected_transfer) in [
+            (Some(250), None, None, "04:10", ""),
+            (None, Some("1 MiB"), Some("2 KiB"), "", "↓ 1 MiB   ↑ 2 KiB"),
+            (None, Some("1 MiB"), None, "", "↓ 1 MiB"),
+            (None, None, Some("2 KiB"), "", "↑ 2 KiB"),
+            (Some(250), Some(" "), Some(""), "04:10", ""),
+        ] {
+            let mut snapshot = connected_with_session();
+            let vpn = snapshot.vpn.as_mut().unwrap();
+            vpn.uptime = uptime.map(Duration::from_secs);
+            vpn.received = received.map(str::to_owned);
+            vpn.sent = sent.map(str::to_owned);
+            app.set_snapshot(snapshot);
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            assert_eq!(row_containing(&terminal, "New York"), 1);
+            assert_eq!(row_containing(&terminal, "Technology"), 6);
+            for (row, label, value) in [
+                (8, "Uptime", expected_uptime),
+                (9, "Transfer", expected_transfer),
+            ] {
+                let row = row_text(&terminal, row);
+                if value.is_empty() {
+                    assert!(row.trim().is_empty());
+                } else {
+                    assert_eq!(row.trim_end(), format!("  {label:<10}  {value}"));
+                }
+            }
+            assert!(!text(&terminal).contains("00:00"));
+            assert!(!text(&terminal).contains("0 B"));
+        }
+        for (ip, server, technology, protocol) in [
+            (Some("192.0.2.100"), None, Some("NORDLYNX"), Some("UDP")),
+            (None, Some("United States #8373"), None, Some("UDP")),
+            (None, None, None, None),
+        ] {
+            let mut snapshot = connected_with_session();
+            let vpn = snapshot.vpn.as_mut().unwrap();
+            vpn.ip = ip.map(str::to_owned);
+            vpn.server = server.map(str::to_owned);
+            vpn.technology = technology.map(str::to_owned);
+            vpn.protocol = protocol.map(str::to_owned);
+            app.set_snapshot(snapshot);
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            assert_eq!(row_containing(&terminal, "New York"), 1);
+            assert_eq!(row_containing(&terminal, "Uptime"), 8);
+            assert_eq!(row_containing(&terminal, "Transfer"), 9);
+            if server.is_none() {
+                assert!(row_text(&terminal, 5).trim().is_empty());
+            }
+            if technology.is_none() && protocol.is_some() {
+                assert_eq!(row_text(&terminal, 6).trim_end(), "  Technology  UDP");
+            }
+        }
+        app.set_snapshot(connected());
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(!text(&terminal).contains("Uptime"));
+        assert!(!text(&terminal).contains("Transfer"));
+        assert_eq!(row_containing(&terminal, "New York"), 3);
+    }
+
+    #[test]
+    fn successive_session_readings_change_only_values_on_the_same_terminal() {
+        let mut app = App::new(Vec::new());
+        app.set_snapshot(connected_with_session());
+        let mut terminal = terminal(&mut app, 80, 12);
+        let initial = terminal.backend().buffer().clone();
+        let mut updated = connected_with_session();
+        let vpn = updated.vpn.as_mut().unwrap();
+        vpn.uptime = Some(Duration::from_secs(3_600));
+        vpn.received = Some("1.01 GiB".into());
+        vpn.sent = Some("2 KiB".into());
+        app.set_snapshot(updated);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let current = terminal.backend().buffer();
+        for row in 0..12 {
+            for column in 0..80 {
+                if ![8, 9].contains(&row) || column < 14 {
+                    assert_eq!(current[(column, row)], initial[(column, row)]);
+                }
+            }
+        }
+        assert_eq!(row_text(&terminal, 8).trim_end(), "  Uptime      01:00:00");
+        assert_eq!(
+            row_text(&terminal, 9).trim_end(),
+            "  Transfer    ↓ 1.01 GiB   ↑ 2 KiB"
+        );
+        assert!(!text(&terminal).contains("15.96"));
+        assert!(!text(&terminal).contains("Refreshing"));
+    }
+
+    #[test]
+    fn session_values_clip_whole_graphemes_and_leave_footer_visible() {
+        let mut snapshot = connected_with_session();
+        let vpn = snapshot.vpn.as_mut().unwrap();
+        vpn.city = Some("東京🧑‍💻東京🧑‍💻東京🧑‍💻東京".into());
+        vpn.server = Some("🧑‍💻東京e\u{301}東京🧑‍💻東京".into());
+        vpn.received = Some("123456789.99 MiB".into());
+        vpn.sent = Some("987654321.99 MiB".into());
+        let mut app = App::new(Vec::new());
+        app.set_snapshot(snapshot);
+        let terminal = terminal(&mut app, 24, 12);
+        let body_width = 20;
+        let lines = panel_lines(&app, body_width);
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.width() <= usize::from(body_width))
+        );
+        let server_value = &lines[4].spans[1].content;
+        assert_eq!(server_value, "🧑‍💻東京e\u{301}…");
+        assert_eq!(Line::from(server_value.as_ref()).width(), 8);
+        assert!(!text(&terminal).contains('�'));
+        assert!(row_text(&terminal, 9).trim_end().ends_with('…'));
+        assert!(row_text(&terminal, 10).starts_with('─'));
+        assert!(row_text(&terminal, 11).ends_with("● Connected "));
+    }
+
+    #[test]
+    fn pending_disconnect_freezes_session_until_confirmed_and_then_clears_it() {
+        let mut app = App::new(Vec::new());
+        app.set_snapshot(connected_with_session());
+        let mut terminal = terminal(&mut app, 80, 12);
+        let initial = panel_cells(&terminal);
+        app.busy = Some(Action::Disconnect);
+        let mut latest = connected_with_session();
+        latest.vpn.as_mut().unwrap().uptime = Some(Duration::from_secs(251));
+        app.set_snapshot(latest.clone());
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(panel_cells(&terminal), initial);
+        latest.vpn.as_mut().unwrap().state = VpnState::Disconnected;
+        app.set_snapshot(latest.clone());
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(panel_cells(&terminal), initial);
+        app.busy = None;
+        app.set_snapshot(latest);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(text(&terminal).contains("Ready to connect"));
+        for stale in [
+            "Uptime", "Transfer", "04:10", "MiB", "Server", "8373", "UDP",
+        ] {
+            assert!(!text(&terminal).contains(stale));
+        }
+        app.set_snapshot(connected_with_session());
+        app.set_snapshot(Snapshot {
+            service: ServiceState::Inactive,
+            vpn: None,
+        });
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(text(&terminal).contains("VPN is off"));
+        assert!(!text(&terminal).contains("Uptime"));
+        assert!(!text(&terminal).contains("Transfer"));
     }
 
     #[test]
@@ -866,6 +1133,11 @@ mod tests {
                         city: None,
                         ip: None,
                         technology: None,
+                        server: None,
+                        protocol: None,
+                        uptime: None,
+                        received: None,
+                        sent: None,
                     }),
                 });
                 let status_width = u16::try_from(Line::from(app.status_text()).width()).unwrap();

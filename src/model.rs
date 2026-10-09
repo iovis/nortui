@@ -25,7 +25,12 @@ pub struct VpnStatus {
     pub country: Option<String>,
     pub city: Option<String>,
     pub ip: Option<String>,
+    pub server: Option<String>,
     pub technology: Option<String>,
+    pub protocol: Option<String>,
+    pub uptime: Option<std::time::Duration>,
+    pub received: Option<String>,
+    pub sent: Option<String>,
 }
 
 impl VpnStatus {
@@ -35,7 +40,12 @@ impl VpnStatus {
             country: None,
             city: None,
             ip: None,
+            server: None,
             technology: None,
+            protocol: None,
+            uptime: None,
+            received: None,
+            sent: None,
         }
     }
 }
