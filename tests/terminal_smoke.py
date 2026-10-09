@@ -99,6 +99,9 @@ elif name == "nordvpn":
             status_event("end")
     elif args[0] == "countries":
         print("United_States\nJapan\nMonaco")
+        if os.environ.get("NORTUI_STOP_AFTER_COUNTRIES") and not (root / "discovery-stopped").exists():
+            (root / "service").write_text("inactive")
+            (root / "discovery-stopped").touch()
     elif args[0] == "cities":
         if args[1] == "Monaco":
             print("Servers by city are not available for this country.", file=sys.stderr)
@@ -861,6 +864,28 @@ class TerminalSmoke(unittest.TestCase):
         widget.send(b"/")
         widget.wait_for(lambda: len(widget.location_commands()) == 12 and "Loading" not in widget.footer())
         self.assertCountEqual(widget.location_commands(), first * 3)
+
+    def test_service_stop_before_discovery_or_between_queries_retries_without_refresh(self):
+        for when in ("before", "between"):
+            with self.subTest(when=when):
+                environment = {"NORTUI_STOP_AFTER_COUNTRIES": "1"} if when == "between" else {}
+                widget = self.widget(service="active", **environment)
+                widget.wait_for(lambda: "Ready to connect" in widget.text())
+                if when == "before":
+                    (widget.root / "service").write_text("inactive")
+                widget.send(b"i")
+                widget.wait_for(lambda: widget.footer().endswith("⦁ Service stopped "))
+                self.assertNotIn("Loading", widget.footer())
+                self.assertFalse(any(command[1] == "cities" for command in widget.location_commands()))
+                widget.send(b"\x1b")
+                widget.wait_for(lambda: "VPN is off" in widget.text())
+                (widget.root / "service").write_text("active")
+                widget.wait_for(lambda: widget.footer().endswith("⦁ Disconnected "))
+                widget.send(b"i")
+                cache = widget.root / "cache/nortui/locations.json"
+                widget.wait_for(lambda: cache.exists() and "Tokyo" in cache.read_text() and "Loading" not in widget.footer())
+                self.assertIn("New York / United States", widget.text())
+                self.assertEqual(sum(command[1] == "countries" for command in widget.location_commands()), 1 if when == "before" else 2)
 
     def test_interrupted_city_loading_retries_only_when_search_opens_again(self):
         for stop_source, delay in (("shortcut", "1.5"), ("external", "3")):

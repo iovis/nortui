@@ -589,7 +589,12 @@ enum DiscoveryEvent {
         finished: usize,
         total: usize,
     },
-    Done(Option<String>),
+    Done(DiscoveryOutcome),
+}
+
+enum DiscoveryOutcome {
+    Complete(Option<String>),
+    Interrupted(ServiceState),
 }
 
 struct Message {
@@ -864,11 +869,18 @@ impl Controller {
                     self.update_catalog();
                 }
             }
-            DiscoveryEvent::Done(error) => {
+            DiscoveryEvent::Done(outcome) => {
                 self.discovery_job = None;
                 self.app.loading = None;
-                if let Some(error) = error {
-                    self.app.set_notice(error, true);
+                match outcome {
+                    DiscoveryOutcome::Complete(Some(error)) => self.app.set_notice(error, true),
+                    DiscoveryOutcome::Complete(None) => {}
+                    DiscoveryOutcome::Interrupted(service) => {
+                        self.discovery_requested = true;
+                        // Use the state discovery actually observed, so a stale
+                        // active snapshot cannot trigger an immediate retry loop.
+                        self.apply_status(Ok(Snapshot { service, vpn: None }));
+                    }
                 }
             }
         }
@@ -962,34 +974,46 @@ fn abort(job: &mut Option<JoinHandle<()>>) {
 
 async fn discover(backend: Backend, sender: Sender<Message>, generation: u64, run: u64) {
     let mut errors = Vec::new();
-    if let Err(error) = discover_inner(backend, &sender, generation, run, &mut errors).await {
-        errors.push(format!("{error:#}"));
-    }
-    let error = (!errors.is_empty()).then(|| {
-        format!(
-            "Location refresh: {} ({} failed; cached entries retained)",
-            errors[0],
-            errors.len()
-        )
-    });
+    let service = match discover_inner(&backend, &sender, generation, run, &mut errors).await {
+        Ok(service) => service,
+        Err(error) => {
+            errors.push(format!("{error:#}"));
+            backend
+                .service_state()
+                .await
+                .unwrap_or_else(|error| ServiceState::Unavailable(format!("{error:#}")))
+        }
+    };
+    let outcome = if service == ServiceState::Active {
+        DiscoveryOutcome::Complete((!errors.is_empty()).then(|| {
+            format!(
+                "Location refresh: {} ({} failed; cached entries retained)",
+                errors[0],
+                errors.len()
+            )
+        }))
+    } else {
+        DiscoveryOutcome::Interrupted(service)
+    };
     let _ = sender.send(Message {
         generation,
         event: Event::Discovery {
             run,
-            event: DiscoveryEvent::Done(error),
+            event: DiscoveryEvent::Done(outcome),
         },
     });
 }
 
 async fn discover_inner(
-    backend: Backend,
+    backend: &Backend,
     sender: &Sender<Message>,
     generation: u64,
     run: u64,
     errors: &mut Vec<String>,
-) -> Result<()> {
-    if backend.service_state().await? != ServiceState::Active {
-        return Ok(());
+) -> Result<ServiceState> {
+    let service = backend.service_state().await?;
+    if service != ServiceState::Active {
+        return Ok(service);
     }
     let countries = backend.countries().await?;
     let total = countries.len();
@@ -1005,7 +1029,7 @@ async fn discover_inner(
         // These futures belong to the discovery job. Aborting and joining that job
         // drops all four children before shutdown awaits the backend's reapers.
         let query =
-            |country| query_country(&backend, sender, generation, run, country, &finished, total);
+            |country| query_country(backend, sender, generation, run, country, &finished, total);
         let results = tokio::join!(
             query(batch.first()),
             query(batch.get(1)),
@@ -1018,7 +1042,7 @@ async fn discover_inner(
                 .flatten(),
         );
     }
-    Ok(())
+    backend.service_state().await
 }
 
 async fn query_country(
@@ -1291,8 +1315,55 @@ mod tests {
                 finished: 1,
                 total: 2,
             },
-            DiscoveryEvent::Done(Some("Old discovery failed".into())),
+            DiscoveryEvent::Done(DiscoveryOutcome::Complete(Some(
+                "Old discovery failed".into(),
+            ))),
         ]
+    }
+
+    #[test]
+    fn interrupted_discovery_waits_for_active_search_and_retries_without_refresh() {
+        for service in [
+            ServiceState::Inactive,
+            ServiceState::Failed,
+            ServiceState::Deactivating,
+            ServiceState::Unavailable("Service unavailable".into()),
+        ] {
+            let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+            let mut controller = discovery_controller(&runtime);
+            let old_run = controller.discovery_generation;
+            controller.apply_discovery(
+                old_run,
+                DiscoveryEvent::Done(DiscoveryOutcome::Interrupted(service.clone())),
+            );
+            assert_eq!(controller.app.snapshot.service, service);
+            assert!(controller.discovery_requested);
+            assert!(controller.discovery_job.is_none());
+            assert_eq!(controller.app.loading, None);
+            for _ in 0..3 {
+                controller.tick();
+                assert!(controller.discovery_job.is_none());
+            }
+            controller.app.show_panel();
+            controller.apply_status(Ok(Snapshot {
+                service: ServiceState::Active,
+                vpn: Some(crate::backend::parse_status("Status: Disconnected\n")),
+            }));
+            controller.tick();
+            assert!(controller.discovery_job.is_none());
+            controller.app.open_search();
+            controller.tick();
+            let new_run = controller.discovery_generation;
+            assert_ne!(old_run, new_run);
+            assert!(controller.discovery_job.is_some());
+            controller.apply_discovery(
+                old_run,
+                DiscoveryEvent::Done(DiscoveryOutcome::Interrupted(ServiceState::Inactive)),
+            );
+            assert_eq!(controller.discovery_generation, new_run);
+            assert_eq!(controller.app.snapshot.service, ServiceState::Active);
+            assert_eq!(controller.app.loading, Some((0, 0)));
+        }
     }
 
     #[test]
@@ -1371,13 +1442,15 @@ mod tests {
         assert!(controller.catalog.locations().iter().any(|location| {
             location.country == "Japan" && location.city.as_deref() == Some("Tokyo")
         }));
-        controller.apply_discovery(run, DiscoveryEvent::Done(None));
+        controller.apply_discovery(run, DiscoveryEvent::Done(DiscoveryOutcome::Complete(None)));
         assert!(controller.discovery_job.is_none());
         assert_eq!(controller.app.loading, None);
         assert!(!controller.discovery_requested);
         controller.apply_discovery(
             run,
-            DiscoveryEvent::Done(Some("Duplicate completion".into())),
+            DiscoveryEvent::Done(DiscoveryOutcome::Complete(Some(
+                "Duplicate completion".into(),
+            ))),
         );
         assert!(controller.app.notice.is_none());
     }
