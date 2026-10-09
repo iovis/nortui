@@ -129,7 +129,6 @@ impl App {
         }
         self.initializing = false;
         self.snapshot = snapshot;
-        self.rebuild(true);
     }
 
     pub fn panel_snapshot(&self) -> Option<&Snapshot> {
@@ -1356,6 +1355,49 @@ mod tests {
             DiscoveryEvent::Done(Some("Duplicate completion".into())),
         );
         assert!(controller.app.notice.is_none());
+    }
+
+    #[test]
+    fn status_only_updates_reuse_search_results_and_preserve_selection_and_scroll() {
+        let mut locations: Vec<_> = (0..24)
+            .map(|index| Location {
+                country: "Test_Country".into(),
+                city: Some(format!("City_{index:02}")),
+            })
+            .collect();
+        let mut app = App::new(locations.clone());
+        app.open_search();
+        app.paste("city");
+        app.move_selection(15);
+        *app.list_state.offset_mut() = 12;
+        let selected_action = app.results[app.selected].action.clone();
+        let results_buffer = app.results.as_ptr();
+        for seconds in 0..3 {
+            app.set_snapshot(Snapshot {
+                service: ServiceState::Active,
+                vpn: Some(crate::backend::parse_status(&format!(
+                    "Status: Connected\nUptime: {seconds} seconds\n"
+                ))),
+            });
+            assert_eq!(app.status_text(), "Connected");
+            assert_eq!(app.results.as_ptr(), results_buffer);
+            assert_eq!(app.results[app.selected].action, selected_action);
+            assert_eq!(app.selected, 15);
+            assert_eq!(app.list_state.selected(), Some(15));
+            assert_eq!(app.list_state.offset(), 12);
+            assert_eq!(app.query, "city");
+            assert_eq!(app.query_cursor(), 4);
+        }
+        locations.push(Location {
+            country: "Test_Country".into(),
+            city: Some("City_24".into()),
+        });
+        app.set_locations(locations);
+        assert_eq!(app.results.len(), 25);
+        assert_eq!(app.results[app.selected].action, selected_action);
+        app.paste(" 24");
+        assert_eq!(app.results.len(), 1);
+        assert!(app.results[0].label.contains("City 24"));
     }
 
     #[test]
