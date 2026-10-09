@@ -519,6 +519,9 @@ fn footer_activity(app: &App) -> (String, Color) {
     if let Some(transition) = transition {
         return (transition.into(), GRAY);
     }
+    if app.is_refreshing() {
+        return ("Refreshing status…".into(), GRAY);
+    }
     if let Some(notice) = app.notice.as_ref().filter(|notice| !notice.is_error) {
         return (notice.message.clone(), GRAY);
     }
@@ -1185,6 +1188,26 @@ mod tests {
                 assert!(!footer.contains("Japan"));
             }
         }
+    }
+
+    #[test]
+    fn explicit_refresh_activity_keeps_gray_spinner_and_confirmed_panel_despite_notice_changes() {
+        let mut app = App::new(Vec::new());
+        app.set_snapshot(connected());
+        let before = terminal(&mut app, 80, 12);
+        let body = panel_cells(&before);
+        app.start_refresh();
+        app.set_notice("Another notice", false);
+        let pending = terminal(&mut app, 80, 12);
+        let footer = row_text(&pending, 11);
+        assert!(footer.contains("Refreshing status…"));
+        assert!(!footer.contains("Another notice"));
+        assert!(footer.ends_with("⦁ Connected "));
+        assert_eq!(panel_cells(&pending), body);
+        let buffer = pending.backend().buffer();
+        assert!(SPINNER_FRAMES.contains(&buffer[(2, 11)].symbol()));
+        assert_eq!(buffer[(2, 11)].fg, GRAY);
+        assert_eq!(buffer[(4, 11)].fg, GRAY);
     }
 
     #[test]

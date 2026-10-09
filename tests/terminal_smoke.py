@@ -703,6 +703,39 @@ class TerminalSmoke(unittest.TestCase):
         self.assertNotIn("Refreshing", widget.footer())
         self.assertFalse(any(frame in widget.footer() for frame in SPINNER_FRAMES))
 
+    def test_delayed_refresh_keeps_progress_until_status_finishes_and_clears_on_failure(self):
+        widget = self.widget(service="active", vpn="Connected", cached=True)
+        widget.wait_for(lambda: "New York" in widget.text())
+        original_body = widget.body()
+        delay = widget.root / "status-delay"
+        delay.write_text("3.5")
+        widget.send(b"r")
+        widget.wait_for(lambda: "Refreshing status…" in widget.footer())
+        raw_start = len(widget.raw)
+        widget.pump(3.1)
+        self.assertIn("Refreshing status…", widget.footer())
+        self.assertIn(widget.footer().lstrip()[0], SPINNER_FRAMES)
+        self.assertEqual(widget.body(), original_body)
+        frames = {frame for frame in SPINNER_FRAMES if frame.encode() in widget.raw[raw_start:]}
+        self.assertGreaterEqual(len(frames), 2)
+        widget.wait_for(lambda: "Status refreshed" in widget.footer())
+        self.assertFalse(any(frame in widget.footer() for frame in SPINNER_FRAMES))
+        delay.write_text("0.2")
+        failure = widget.root / "status-failure"
+        failure.touch()
+        widget.send(b"r")
+        widget.wait_for(lambda: "Refreshing status…" in widget.footer())
+        widget.wait_for(lambda: "VPN unavailable" in widget.footer())
+        self.assertIn("Temporary VPN status failure", widget.text())
+        self.assertNotIn("Refreshing", widget.footer())
+        self.assertFalse(any(frame in widget.footer() for frame in SPINNER_FRAMES))
+        self.assertEqual(widget.body()[:-1], original_body[:-1], "Only the error row should change")
+        failure.unlink()
+        widget.send(b"r")
+        widget.wait_for(lambda: "Status refreshed" in widget.footer() and "Connected" in widget.footer())
+        self.assertNotIn("Temporary VPN status failure", widget.text())
+        self.assertEqual(widget.location_commands(), [])
+
     def test_city_loading_spinner_animates_while_searching_and_disappears_when_done(self):
         widget = self.widget(service="active", cached=True, NORTUI_CITY_DELAY="1")
         widget.wait_for(lambda: "Disconnected" in widget.footer())

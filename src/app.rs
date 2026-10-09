@@ -31,7 +31,6 @@ use crate::ui;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const CONNECTED_POLL_INTERVAL: Duration = Duration::from_secs(1);
-const REFRESH_NOTICE: &str = "Refreshing status…";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Mode {
@@ -85,6 +84,7 @@ pub struct App {
     panel_snapshot: Option<Snapshot>,
     initializing: bool,
     action_preparing: bool,
+    refreshing: bool,
     query_cursor: usize,
     matcher: Matcher,
 }
@@ -106,6 +106,7 @@ impl App {
             panel_snapshot: None,
             initializing: true,
             action_preparing: false,
+            refreshing: false,
             query_cursor: 0,
             matcher: Matcher::new(Config::DEFAULT),
         };
@@ -156,11 +157,18 @@ impl App {
         });
     }
 
+    pub fn start_refresh(&mut self) {
+        self.refreshing = true;
+        self.notice = None;
+    }
+
+    pub fn is_refreshing(&self) -> bool {
+        self.refreshing
+    }
+
     pub fn expire_notice(&mut self) {
         if self.notice.as_ref().is_some_and(|notice| {
-            !notice.is_error
-                && notice.message != REFRESH_NOTICE
-                && notice.created.elapsed() > Duration::from_secs(3)
+            !notice.is_error && notice.created.elapsed() > Duration::from_secs(3)
         }) {
             self.notice = None;
         }
@@ -180,10 +188,7 @@ impl App {
                     .vpn
                     .as_ref()
                     .is_some_and(|vpn| vpn.state == VpnState::Connecting))
-            || self
-                .notice
-                .as_ref()
-                .is_some_and(|notice| !notice.is_error && notice.message == REFRESH_NOTICE)
+            || self.is_refreshing()
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Input {
@@ -710,12 +715,13 @@ impl Controller {
         if self.app.busy.is_some() {
             return;
         }
+        self.app.refreshing = false;
         self.generation += 1;
         abort(&mut self.status_job);
         self.cancel_discovery();
         self.discovery_requested |= action == Action::Refresh;
         if action == Action::Refresh {
-            self.app.set_notice(REFRESH_NOTICE, false);
+            self.app.start_refresh();
             self.spawn_status();
             return;
         }
@@ -868,6 +874,7 @@ impl Controller {
     }
 
     fn apply_status(&mut self, result: std::result::Result<Snapshot, String>) {
+        let refreshed = std::mem::take(&mut self.app.refreshing);
         let snapshot = match result {
             Ok(snapshot) => snapshot,
             Err(error) => Snapshot {
@@ -896,12 +903,13 @@ impl Controller {
         }) {
             self.app.notice = None;
         }
-        if next_error.is_none()
-            && self
+        if refreshed
+            && next_error.is_none()
+            && !self
                 .app
                 .notice
                 .as_ref()
-                .is_some_and(|notice| !notice.is_error && notice.message == REFRESH_NOTICE)
+                .is_some_and(|notice| notice.is_error)
         {
             self.app.set_notice("Status refreshed", false);
         }
@@ -1943,10 +1951,29 @@ mod tests {
     }
 
     #[test]
+    fn refresh_label_in_an_ordinary_notice_does_not_start_work_or_prevent_expiration() {
+        let mut app = App::new(Vec::new());
+        app.set_snapshot(Snapshot {
+            service: ServiceState::Inactive,
+            vpn: None,
+        });
+        app.set_notice("Refreshing status…", false);
+        assert!(!app.is_working());
+        app.notice.as_mut().unwrap().created = Instant::now() - Duration::from_secs(4);
+        app.expire_notice();
+        assert!(app.notice.is_none());
+        app.set_notice("An error", true);
+        app.notice.as_mut().unwrap().created = Instant::now() - Duration::from_secs(4);
+        app.expire_notice();
+        assert!(app.notice.as_ref().unwrap().is_error);
+    }
+
+    #[test]
     fn completed_refresh_does_not_leave_the_footer_showing_refresh_in_progress() {
-        let runtime = Runtime::new().unwrap();
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
         let mut controller = Controller::new(Backend::new(), runtime.handle().clone());
-        controller.app.set_notice(REFRESH_NOTICE, false);
+        controller.execute(Action::Refresh);
+        assert!(controller.app.is_refreshing());
         assert!(controller.app.is_working());
         controller.apply_status(Ok(Snapshot {
             service: ServiceState::Inactive,
@@ -1957,11 +1984,47 @@ mod tests {
             "Status refreshed"
         );
         assert!(!controller.app.is_working());
-        controller.app.set_notice(REFRESH_NOTICE, false);
+        controller.execute(Action::Refresh);
         controller.apply_status(Err("Cannot query systemd".into()));
         let notice = controller.app.notice.as_ref().unwrap();
         assert!(notice.is_error);
         assert_eq!(notice.message, "Cannot query systemd");
+        assert!(!controller.app.is_refreshing());
         assert!(!controller.app.is_working());
+    }
+
+    #[test]
+    fn refresh_activity_survives_notice_changes_and_clears_when_superseded() {
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let mut controller = Controller::new(Backend::new(), runtime.handle().clone());
+        controller.app.set_snapshot(Snapshot {
+            service: ServiceState::Inactive,
+            vpn: None,
+        });
+        controller.execute(Action::Refresh);
+        controller.app.set_notice("Temporary notice", false);
+        controller.app.notice.as_mut().unwrap().created = Instant::now() - Duration::from_secs(4);
+        controller.app.expire_notice();
+        assert!(controller.app.notice.is_none());
+        assert!(controller.app.is_refreshing());
+        assert!(controller.app.is_working());
+        controller.app.set_notice("Unrelated error", true);
+        controller.apply_status(Ok(Snapshot {
+            service: ServiceState::Inactive,
+            vpn: None,
+        }));
+        assert!(!controller.app.is_refreshing());
+        assert!(!controller.app.is_working());
+        assert_eq!(
+            controller.app.notice.as_ref().unwrap().message,
+            "Unrelated error"
+        );
+        assert!(controller.app.notice.as_ref().unwrap().is_error);
+        controller.execute(Action::Refresh);
+        assert!(controller.app.notice.is_none());
+        assert!(controller.app.is_refreshing());
+        controller.execute(Action::StartService);
+        assert!(!controller.app.is_refreshing());
+        assert_eq!(controller.app.busy, Some(Action::StartService));
     }
 }
