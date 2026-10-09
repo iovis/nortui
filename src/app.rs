@@ -27,6 +27,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::backend::{Authentication, Backend};
 use crate::cache::{self, Catalog};
 use crate::model::{Action, Location, ServiceState, Snapshot, VpnState};
+use crate::terminal::TerminalMode;
 use crate::ui;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -1079,17 +1080,29 @@ type WidgetTerminal = Terminal<CrosstermBackend<TerminalOutput>>;
 
 struct TerminalSession {
     terminal: WidgetTerminal,
+    original_mode: TerminalMode,
 }
 
 impl TerminalSession {
     fn new() -> Result<Self> {
+        let original_mode = TerminalMode::capture()?;
+        let panic_mode = original_mode.clone();
         let previous_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |information| {
             let _ = ratatui::try_restore();
+            let _ = panic_mode.restore();
             previous_hook(information);
         }));
+        let terminal = match Self::initialize().context("Cannot initialize terminal") {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                let _ = original_mode.restore();
+                return Err(error);
+            }
+        };
         Ok(Self {
-            terminal: Self::initialize().context("Cannot initialize terminal")?,
+            terminal,
+            original_mode,
         })
     }
 
@@ -1115,6 +1128,9 @@ impl TerminalSession {
         disable_raw_mode().context("Cannot restore terminal input for authentication")?;
         execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0))?;
         let result = operation();
+        // A killed sudo can leave password echo disabled. Restore our saved
+        // attributes before Crossterm captures the next raw-mode baseline.
+        self.original_mode.restore()?;
         enable_raw_mode().context("Cannot restore terminal input after authentication")?;
         execute!(
             io::stdout(),
@@ -1136,6 +1152,7 @@ impl Drop for TerminalSession {
         // restore() prints on failure, which can panic when stderr is the same
         // deleted terminal. Cleanup must reach the controller's child reapers.
         let _ = ratatui::try_restore();
+        let _ = self.original_mode.restore();
     }
 }
 

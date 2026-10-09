@@ -405,6 +405,7 @@ dependencies = [
  "crossterm",
  "nucleo-matcher",
  "ratatui",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

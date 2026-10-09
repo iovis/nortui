@@ -49,10 +49,18 @@ elif name == "sudo":
         sys.exit(0 if (root / "credentials").exists() else 1)
     if args == ["-v"]:
         (root / "auth.pid").write_text(str(os.getpid()))
-        flags = termios.tcgetattr(0)[3]
+        attributes = termios.tcgetattr(0)
+        flags = attributes[3]
         assert flags & termios.ICANON and flags & termios.ECHO, "sudo received raw terminal"
-        print("AUTH_COOKED password: ", end="", flush=True)
-        sys.stdin.readline()
+        password_attributes = termios.tcgetattr(0)
+        password_attributes[3] &= ~termios.ECHO
+        termios.tcsetattr(0, termios.TCSANOW, password_attributes)
+        try:
+            print("AUTH_COOKED password: ", end="", flush=True)
+            sys.stdin.readline()
+        finally:
+            # A killed authentication child cannot execute this restoration.
+            termios.tcsetattr(0, termios.TCSANOW, attributes)
         failure = int(os.environ.get("NORTUI_AUTH_FAILURE", "0"))
         if failure:
             sys.exit(failure)
@@ -211,7 +219,8 @@ class Widget:
             path.write_text(json.dumps({"version": 1, "updated_at": 0, "countries": {"United_States": ["New_York"]}}))
         self.master, self.slave = os.openpty()
         fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack("HHHH", height, width, 0, 0))
-        self.original_flags = termios.tcgetattr(self.slave)[3]
+        self.original_attributes = termios.tcgetattr(self.slave)
+        self.original_flags = self.original_attributes[3]
         env = dict(os.environ, TERM="xterm-256color", PATH=f"{self.root}:/usr/bin", NORTUI_FIXTURE=str(self.root), XDG_CACHE_HOME=str(self.root / "cache"), **environment)
         self.process = subprocess.Popen([BINARY], stdin=self.slave, stdout=self.slave, stderr=self.slave, env=env, start_new_session=True)
         self.screen = Screen(width, height)
@@ -572,6 +581,7 @@ class TerminalSmoke(unittest.TestCase):
         widget.wait_for(lambda: "Service stopped" in widget.text())
         widget.send(b"/new york\r")
         widget.wait_for(lambda: b"AUTH_COOKED" in widget.raw)
+        self.assertFalse(termios.tcgetattr(widget.slave)[3] & termios.ECHO)
         widget.send(b"password\n")
         widget.wait_for(lambda: ["nordvpn", "connect", "United_States", "New_York"] in widget.commands())
         widget.wait_for(lambda: "Connected" in widget.text())
@@ -582,6 +592,7 @@ class TerminalSmoke(unittest.TestCase):
         self.assertNotIn("Search countries", widget.text())
         self.assertIsNone(widget.process.poll())
         self.assertFalse(termios.tcgetattr(widget.slave)[3] & termios.ICANON)
+        self.assertNotIn(b"password\r\n", widget.raw)
 
     def test_authentication_failure_restores_tui_without_connecting(self):
         for failure in ("1", "130"):
@@ -626,7 +637,7 @@ class TerminalSmoke(unittest.TestCase):
                     self.assertEqual(restored, original_primary)
                     self.assertNotIn("AUTH_COOKED", restored)
                 self.assertEqual(widget.text(), original_primary)
-                self.assertEqual(termios.tcgetattr(widget.slave)[3], widget.original_flags)
+                self.assertEqual(termios.tcgetattr(widget.slave), widget.original_attributes)
 
     def test_signals_during_authentication_exit_and_reap_without_running_action(self):
         for exit_signal in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
@@ -640,6 +651,7 @@ class TerminalSmoke(unittest.TestCase):
                 widget.wait_for(lambda: "AUTH_COOKED" in widget.text())
                 pid = int((widget.root / "auth.pid").read_text())
                 self.assertTrue(Path(f"/proc/{pid}").exists())
+                self.assertFalse(termios.tcgetattr(widget.slave)[3] & termios.ECHO)
                 widget.process.send_signal(exit_signal)
                 self.assertEqual(widget.process.wait(timeout=3), 0)
                 widget.pump()
@@ -647,13 +659,33 @@ class TerminalSmoke(unittest.TestCase):
                 self.assertEqual((widget.root / "service").read_text(), "inactive")
                 self.assertFalse(any(command[:2] in (["nordvpn", "connect"], ["systemctl", "start"]) for command in widget.commands()))
                 self.assertFalse((widget.root / "credentials").exists())
-                self.assertEqual(termios.tcgetattr(widget.slave)[3], widget.original_flags)
+                self.assertEqual(termios.tcgetattr(widget.slave), widget.original_attributes)
                 self.assertFalse(widget.screen.alternate_active)
                 self.assertTrue(widget.screen.restored_screens)
                 for restored in widget.screen.restored_screens:
                     self.assertEqual(restored, original_primary)
                     self.assertNotIn("AUTH_COOKED", restored)
                 self.assertEqual(widget.text(), original_primary)
+
+    def test_killed_authentication_child_restores_tui_and_original_terminal_settings(self):
+        widget = self.widget(cached=True)
+        widget.wait_for(lambda: "Service stopped" in widget.text())
+        widget.send(b"c")
+        widget.wait_for(lambda: "AUTH_COOKED" in widget.text())
+        pid = int((widget.root / "auth.pid").read_text())
+        self.assertFalse(termios.tcgetattr(widget.slave)[3] & termios.ECHO)
+        os.kill(pid, signal.SIGKILL)
+        widget.wait_for(lambda: "Sudo authentication was canceled or failed" in widget.text())
+        self.assertFalse(Path(f"/proc/{pid}").exists())
+        self.assertFalse(termios.tcgetattr(widget.slave)[3] & termios.ICANON)
+        self.assertFalse(widget.screen.cursor_visible)
+        self.assertEqual((widget.root / "service").read_text(), "inactive")
+        self.assertFalse(any(command[:2] in (["nordvpn", "connect"], ["systemctl", "start"]) for command in widget.commands()))
+        widget.send(b"q")
+        self.assertEqual(widget.process.wait(timeout=3), 0)
+        widget.pump()
+        self.assertEqual(termios.tcgetattr(widget.slave), widget.original_attributes)
+        self.assertFalse(widget.screen.alternate_active)
 
     def test_closing_terminal_during_authentication_reaps_without_running_action(self):
         widget = self.widget(cached=True)
