@@ -166,6 +166,8 @@ class Widget:
         self.raw = b""
 
     def pump(self, seconds=0.05):
+        if self.master is None:
+            return
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             ready, _, _ = select.select([self.master], [], [], max(0, deadline - time.monotonic()))
@@ -199,15 +201,20 @@ class Widget:
 
     def close(self):
         if self.process.poll() is None:
-            self.send(b"\x03")
+            if self.master is not None:
+                self.send(b"\x03")
             try:
                 self.process.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait()
         self.pump()
-        flags = termios.tcgetattr(self.slave)[3]
-        os.close(self.master)
+        try:
+            flags = termios.tcgetattr(self.slave)[3]
+        except termios.error:
+            flags = None  # A closed terminal no longer accepts terminal ioctls.
+        if self.master is not None:
+            os.close(self.master)
         os.close(self.slave)
         self.directory.cleanup()
         return flags
@@ -263,7 +270,7 @@ class TerminalSmoke(unittest.TestCase):
         widget.wait_for(lambda: (widget.root / "connect.pid").exists())
         pid = int((widget.root / "connect.pid").read_text())
         widget.send(b"\r\r\x15Tokyo")
-        widget.wait_for(lambda: "Tokyo" in widget.text().splitlines()[1])
+        widget.wait_for(lambda: "Tokyo" in widget.text().splitlines()[0])
         self.assertEqual(sum(command[:2] == ["nordvpn", "connect"] for command in widget.commands()), 1)
         widget.send(b"\x03")
         self.assertEqual(widget.process.wait(timeout=3), 0)
@@ -288,6 +295,29 @@ class TerminalSmoke(unittest.TestCase):
         widget.process.send_signal(signal.SIGTERM)
         self.assertEqual(widget.process.wait(timeout=3), 0)
         self.assertEqual(termios.tcgetattr(widget.slave)[3], widget.original_flags)
+
+    def test_closing_terminal_exits_without_hangup_signal(self):
+        widget = self.widget()
+        widget.wait_for(lambda: "Service stopped" in widget.text())
+        # There is no controlling terminal in this fixture, so closing the
+        # master supplies EOF without SIGHUP. The input reader must handle it.
+        widget.pump(0.1)
+        os.close(widget.master)
+        widget.master = None
+        self.assertEqual(widget.process.wait(timeout=3), 0)
+
+    def test_closing_terminal_during_connection_reaps_child(self):
+        widget = self.widget(service="active", cached=True, NORTUI_CONNECT_DELAY="10")
+        widget.wait_for(lambda: "Disconnected" in widget.text())
+        widget.send(b"new york\r")
+        widget.wait_for(lambda: (widget.root / "connect.pid").exists())
+        pid = int((widget.root / "connect.pid").read_text())
+        widget.pump(0.1)
+        os.close(widget.master)
+        widget.master = None
+        self.assertEqual(widget.process.wait(timeout=3), 0)
+        self.assertFalse(Path(f"/proc/{pid}").exists())
+        self.assertFalse(any(command[:2] == ["nordvpn", "disconnect"] for command in widget.commands()))
 
     def test_service_and_connection_commands_complete_a_full_lifecycle(self):
         widget = self.widget()

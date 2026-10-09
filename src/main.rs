@@ -1,3 +1,4 @@
+use std::io::{self, Write};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -6,13 +7,13 @@ fn main() -> ExitCode {
         [] => match nortui::app::run(nortui::backend::Backend::new()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
-                eprintln!("nortui: {error:#}");
+                let _ = writeln!(io::stderr(), "nortui: {error:#}");
                 ExitCode::FAILURE
             }
         },
         [argument] if argument == "--help" || argument == "-h" => {
             println!(
-                "nortui — a searchable NordVPN terminal widget\n\nUsage: nortui [--help | --version]\n\nType to search commands, countries, and cities.\n↑/↓ or Ctrl-N/P: select   Enter: run   Ctrl-R: refresh\nCtrl-U: clear   Esc: clear search, then close   Ctrl-C: close\n\nConnect starts nordvpnd.service on demand. Service changes may\nask for your sudo password in the terminal. Closing leaves the VPN alone.\n\nWidget: kitty --class=widget.nortui -e nortui"
+                "nortui — a searchable NordVPN terminal widget\n\nUsage: nortui [--help | --version]\n\nType to search commands, countries, and cities.\n↑/↓, Ctrl-K/J or Ctrl-P/N: select   Enter: run   Ctrl-R: refresh\nCtrl-U: clear   Esc: clear search, then close   Ctrl-C: close\n\nConnect starts nordvpnd.service on demand. Service changes may\nask for your sudo password in the terminal. Closing leaves the VPN alone.\n\nWidget: kitty --class=widget.nortui -e nortui"
             );
             ExitCode::SUCCESS
         }
@@ -21,7 +22,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         _ => {
-            eprintln!("nortui: unknown arguments; use --help");
+            let _ = writeln!(io::stderr(), "nortui: unknown arguments; use --help");
             ExitCode::FAILURE
         }
     }

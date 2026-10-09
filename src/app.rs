@@ -122,11 +122,11 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return match key.code {
                 KeyCode::Char('c') => Input::Exit,
-                KeyCode::Char('n') => {
+                KeyCode::Char('n' | 'j') => {
                     self.move_selection(1);
                     Input::None
                 }
-                KeyCode::Char('p') => {
+                KeyCode::Char('p' | 'k') => {
                     self.move_selection(-1);
                     Input::None
                 }
@@ -271,6 +271,9 @@ impl App {
             rows.push(command_row("Start service", Action::StartService));
         }
         rows.push(command_row("Refresh", Action::Refresh));
+        if self.query.trim().is_empty() {
+            return rows;
+        }
         let mut locations: Vec<_> = self
             .locations
             .iter()
@@ -302,7 +305,7 @@ impl App {
                     .map(|row| row.action.clone())
             })
             .flatten();
-        let query = self.query.replace('_', " ");
+        let query = self.query.trim().replace('_', " ");
         let pattern = Pattern::parse(&query, CaseMatching::Ignore, Normalization::Smart);
         let mut buffer = Vec::new();
         let mut scored: Vec<_> = self
@@ -319,7 +322,7 @@ impl App {
                 Some((score, row))
             })
             .collect();
-        if !self.query.is_empty() {
+        if !query.is_empty() {
             let exact_query = query
                 .split_whitespace()
                 .collect::<Vec<_>>()
@@ -780,7 +783,7 @@ impl TerminalSession {
 
     fn suspend<T>(&mut self, operation: impl FnOnce() -> T) -> Result<T> {
         execute!(io::stdout(), DisableBracketedPaste)?;
-        ratatui::restore();
+        ratatui::try_restore().context("Cannot restore terminal for authentication")?;
         let result = operation();
         self.terminal =
             ratatui::try_init().context("Cannot restore terminal after authentication")?;
@@ -795,7 +798,9 @@ impl TerminalSession {
 impl Drop for TerminalSession {
     fn drop(&mut self) {
         let _ = execute!(io::stdout(), DisableBracketedPaste);
-        ratatui::restore();
+        // restore() prints on failure, which can panic when stderr is the same
+        // deleted terminal. Cleanup must reach the controller's child reapers.
+        let _ = ratatui::try_restore();
     }
 }
 
@@ -822,13 +827,23 @@ fn run_with_runtime(backend: Backend, runtime: &Runtime) -> Result<()> {
         controller.shutdown().await;
         let _ = signal_job.await;
     });
-    result
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        // Closing the window can race a draw/read and produce an I/O error.
+        Ok(())
+    } else {
+        result
+    }
 }
 
 fn run_loop(controller: &mut Controller) -> Result<()> {
     let mut terminal = TerminalSession::new()?;
     controller.spawn_status();
     loop {
+        // A closed widget no longer has a usable terminal. The bounded input
+        // reader returns on EOF, allowing this check and final child cleanup.
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            break;
+        }
         if !controller.receive(&mut terminal)? {
             break;
         }
@@ -909,6 +924,48 @@ mod tests {
         assert_eq!(app.handle_key(key(KeyCode::Esc)), Input::None);
         assert!(app.query.is_empty());
         assert_eq!(app.handle_key(key(KeyCode::Esc)), Input::Exit);
+    }
+
+    #[test]
+    fn locations_only_appear_during_search_and_hide_again_after_clear() {
+        let mut app = App::new(vec![
+            Location {
+                country: "Japan".into(),
+                city: None,
+            },
+            Location {
+                country: "Japan".into(),
+                city: Some("Tokyo".into()),
+            },
+        ]);
+        assert!(app.results.iter().all(|row| row.kind == ItemKind::Command));
+        app.paste("japan");
+        assert_eq!(app.results.len(), 2);
+        assert_eq!(app.results[0].kind, ItemKind::Country);
+        assert_eq!(app.results[1].kind, ItemKind::City);
+        app.handle_key(key(KeyCode::Esc));
+        app.paste("  ");
+        assert!(!app.results.is_empty());
+        assert!(app.results.iter().all(|row| row.kind == ItemKind::Command));
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(app.query.is_empty());
+        assert!(app.results.iter().all(|row| row.kind == ItemKind::Command));
+    }
+
+    #[test]
+    fn control_j_k_move_selection_without_changing_search() {
+        let mut app = App::new(Vec::new());
+        assert_eq!(app.selected, 0);
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+            Input::None
+        );
+        assert_eq!(app.results[app.selected].action, Action::Refresh);
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert_eq!(app.selected, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert_eq!(app.selected, 0);
+        assert!(app.query.is_empty());
     }
 
     #[test]

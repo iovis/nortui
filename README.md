@@ -15,11 +15,11 @@ Or run from the checkout with `cargo run`.
 
 ## Use
 
-Type immediately to search. A city result includes its country; selecting it connects using both CLI arguments. With an empty search, available commands appear first.
+Type immediately to search. A city result includes its country; selecting it connects using both CLI arguments. With an empty search, only available commands appear; countries and cities appear while searching.
 
 | Key | Action |
 | --- | --- |
-| ↑ / ↓ or Ctrl-P / Ctrl-N | Select a result |
+| ↑ / ↓, Ctrl-K / Ctrl-J, or Ctrl-P / Ctrl-N | Select a result |
 | Page Up / Page Down | Move ten results |
 | Enter | Run the selection |
 | Ctrl-U | Clear search |
@@ -33,7 +33,7 @@ When service control needs authentication, nortui temporarily restores the termi
 
 Status refreshes every two seconds. Countries and cities load progressively while the service runs and are cached at `$XDG_CACHE_HOME/nortui/locations.json` (normally `~/.cache/nortui/locations.json`). Cached locations remain searchable while the service is stopped. On a first launch with no cache, choose **Start service** to load locations, or **Connect recommended** to start and connect immediately. Ctrl-R refreshes without starting a stopped service.
 
-The footer reports the service and VPN state, connected country/city, and IP/technology when space permits. Commands run in the background; notices appear above the footer. A failed command preserves the interface and reports its error. NordVPN queries require access to its daemon, typically through membership in the `nordvpn` group. Unknown status output is shown as unavailable.
+The right-aligned gray footer reports the service and VPN state, connected country/city, and IP/technology when space permits. Its circle is green when connected, red when disconnected, and gray when the service is stopped. The interface uses Catppuccin Frappé with a transparent terminal background and a #232634 selection highlight. Commands run in the background; notices appear above the footer. A failed command preserves the interface and reports its error. NordVPN queries require access to its daemon, typically through membership in the `nordvpn` group. Unknown status output is shown as unavailable.
 
 ## Hyprland widget
 
