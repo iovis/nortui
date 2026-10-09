@@ -1,3 +1,4 @@
+use std::ops::Range;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -5,7 +6,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::app::{App, Mode, SearchResult};
@@ -22,6 +23,7 @@ const YELLOW: Color = Color::Rgb(229, 200, 144);
 const SELECTED_BACKGROUND: Color = Color::Rgb(35, 38, 52);
 const INSET: u16 = 2;
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+pub const SPINNER_INTERVAL: Duration = Duration::from_millis(60);
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
@@ -410,6 +412,7 @@ fn render_search(frame: &mut Frame, app: &mut App, area: Rect) {
         search,
     );
     frame.set_cursor_position((search.x + 2 + cursor_column, search.y));
+    let visible = visible_results(app, results.height);
     if app.results.is_empty() {
         let message = if app.query.trim().is_empty() {
             "No cached locations"
@@ -435,8 +438,9 @@ fn render_search(frame: &mut Frame, app: &mut App, area: Rect) {
             );
         }
     } else {
-        let rows: Vec<_> = app
-            .results
+        let mut local_state = ListState::default();
+        local_state.select((!visible.is_empty()).then(|| app.selected - visible.start));
+        let rows: Vec<_> = app.results[visible]
             .iter()
             .map(|row| list_item(row, results.width))
             .collect();
@@ -448,8 +452,32 @@ fn render_search(frame: &mut Frame, app: &mut App, area: Rect) {
                     .bg(SELECTED_BACKGROUND)
                     .add_modifier(Modifier::BOLD),
             );
-        frame.render_stateful_widget(list, results, &mut app.list_state);
+        frame.render_stateful_widget(list, results, &mut local_state);
     }
+}
+
+fn visible_results(app: &mut App, height: u16) -> Range<usize> {
+    let count = app.results.len();
+    if count == 0 {
+        app.list_state.select(None);
+        *app.list_state.offset_mut() = 0;
+        return 0..0;
+    }
+    app.list_state.select(Some(app.selected));
+    if height == 0 {
+        let start = app.list_state.offset().min(count - 1);
+        *app.list_state.offset_mut() = start;
+        return start..start;
+    }
+    let height = usize::from(height);
+    let mut start = app.list_state.offset().min(count.saturating_sub(height));
+    if app.selected < start {
+        start = app.selected;
+    } else if app.selected >= start + height {
+        start = app.selected + 1 - height;
+    }
+    *app.list_state.offset_mut() = start;
+    start..(start + height).min(count)
 }
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
@@ -481,7 +509,8 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
 fn spinner_frame() -> &'static str {
     static STARTED: OnceLock<Instant> = OnceLock::new();
     let elapsed = STARTED.get_or_init(Instant::now).elapsed();
-    let index = (elapsed.as_millis() / 60) % (SPINNER_FRAMES.len() as u128);
+    let index =
+        (elapsed.as_millis() / SPINNER_INTERVAL.as_millis()) % (SPINNER_FRAMES.len() as u128);
     SPINNER_FRAMES[usize::try_from(index).unwrap_or(0)]
 }
 
@@ -705,6 +734,15 @@ mod tests {
             country: "Japan".into(),
             city: None,
         }
+    }
+
+    fn catalog_locations(range: Range<usize>) -> Vec<Location> {
+        range
+            .map(|index| Location {
+                country: format!("Place{index:03}"),
+                city: None,
+            })
+            .collect()
     }
 
     #[test]
@@ -1133,6 +1171,115 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn long_search_navigation_keeps_global_selection_and_renders_its_visible_window() {
+        let mut app = App::new(catalog_locations(0..400));
+        app.set_snapshot(connected());
+        app.open_search();
+        let mut terminal = terminal(&mut app, 24, 8);
+        assert_eq!(app.list_state.offset(), 0);
+        assert!(row_text(&terminal, 3).contains("Place000"));
+        for _ in 0..40 {
+            app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        }
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.selected, 399);
+        assert_eq!(app.list_state.selected(), Some(399));
+        assert_eq!(app.list_state.offset(), 397);
+        for (row, label) in [(3, "Place397"), (4, "Place398"), (5, "Place399")] {
+            assert!(row_text(&terminal, row).contains(label));
+            assert!(row_text(&terminal, row).trim_end().ends_with("Country"));
+        }
+        assert!(!text(&terminal).contains("Place396"));
+        assert!(!text(&terminal).contains("Place000"));
+        assert_eq!(terminal.backend().buffer()[(4, 5)].bg, SELECTED_BACKGROUND);
+        assert_eq!(terminal.backend().buffer()[(4, 3)].bg, Color::Reset);
+        assert_eq!(
+            app.results[app.selected].action,
+            Action::Connect(Some(Location {
+                country: "Place399".into(),
+                city: None,
+            }))
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.selected, 389);
+        assert_eq!(app.list_state.selected(), Some(389));
+        assert_eq!(app.list_state.offset(), 389);
+        assert!(row_text(&terminal, 3).contains("Place389"));
+        assert_eq!(terminal.backend().buffer()[(4, 3)].bg, SELECTED_BACKGROUND);
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.selected, 388);
+        assert_eq!(app.list_state.selected(), Some(388));
+        assert_eq!(app.list_state.offset(), 388);
+        assert!(row_text(&terminal, 3).contains("Place388"));
+    }
+
+    #[test]
+    fn search_window_clamps_after_resize_and_catalog_or_query_reduction_without_stale_rows() {
+        let mut app = App::new(catalog_locations(0..400));
+        app.set_snapshot(connected());
+        app.open_search();
+        for _ in 0..40 {
+            app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        }
+        let mut terminal = terminal(&mut app, 40, 10);
+        assert_eq!(app.list_state.offset(), 395);
+        terminal.backend_mut().resize(40, 16);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.selected, 399);
+        assert_eq!(app.list_state.offset(), 389);
+        assert!(row_text(&terminal, 3).contains("Place389"));
+        assert!(row_text(&terminal, 13).contains("Place399"));
+        terminal.backend_mut().resize(40, 6);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.list_state.offset(), 399);
+        assert!(row_text(&terminal, 3).contains("Place399"));
+        assert!(!text(&terminal).contains("Place398"));
+
+        app.set_locations(catalog_locations(390..400));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.selected, 9);
+        assert_eq!(app.list_state.selected(), Some(9));
+        assert_eq!(app.list_state.offset(), 9);
+        terminal.backend_mut().resize(24, 5);
+        app.set_notice("Status read failed", true);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.selected, 9);
+        assert_eq!(app.list_state.selected(), Some(9));
+        assert_eq!(app.list_state.offset(), 9);
+        assert!(!text(&terminal).contains("Place399"));
+        assert!(row_text(&terminal, 2).contains("Status read failed"));
+        app.notice = None;
+        terminal.backend_mut().resize(40, 6);
+
+        app.paste("Place390");
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.results.len(), 1);
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.list_state.selected(), Some(0));
+        assert_eq!(app.list_state.offset(), 0);
+        assert!(row_text(&terminal, 3).contains("Place390"));
+        assert!(!text(&terminal).contains("Place399"));
+        assert_eq!(terminal.backend().buffer()[(4, 3)].fg, BLUE);
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        app.paste("zzzz");
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(row_text(&terminal, 3).contains("No matches"));
+        assert_eq!(app.list_state.selected(), None);
+        assert_eq!(app.list_state.offset(), 0);
+        assert!(!text(&terminal).contains("Place390"));
+        assert_eq!(terminal.backend().buffer()[(4, 3)].bg, Color::Reset);
+        app.open_search();
+        app.set_locations(Vec::new());
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(row_text(&terminal, 3).contains("No cached locations"));
+        assert_eq!(app.list_state.selected(), None);
+        assert_eq!(app.list_state.offset(), 0);
     }
 
     #[test]

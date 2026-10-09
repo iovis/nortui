@@ -314,6 +314,26 @@ class TerminalSmoke(unittest.TestCase):
         self.addCleanup(widget.close)
         return widget
 
+    def test_idle_views_do_not_repaint_and_notice_expiry_still_redraws(self):
+        widget = self.widget(cached=True)
+        widget.wait_for(lambda: "Service stopped" in widget.footer())
+        for mode in ("panel", "search"):
+            with self.subTest(mode=mode):
+                if mode == "search":
+                    widget.send(b"i")
+                    widget.wait_for(lambda: widget.query() == "Search countries and cities…")
+                widget.pump(0.15)
+                before = len(widget.raw)
+                widget.pump(0.4)
+                self.assertEqual(len(widget.raw), before, "Idle view kept redrawing")
+        widget.send(b"\x1b")
+        widget.wait_for(lambda: "VPN is off" in widget.text())
+        widget.send(b"r")
+        widget.wait_for(lambda: "Status refreshed" in widget.footer())
+        widget.pump(3.2)
+        self.assertNotIn("Status refreshed", widget.footer())
+        self.assertTrue(widget.footer().endswith("⦁ Service stopped "))
+
     def test_connected_telemetry_updates_each_second_without_layout_or_footer_activity(self):
         widget = self.widget(service="active", vpn="Connected", cached=True, width=80, height=14, NORTUI_TELEMETRY="1")
         widget.wait_for(lambda: "New York" in widget.text())

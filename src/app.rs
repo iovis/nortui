@@ -32,6 +32,9 @@ use crate::ui;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const CONNECTED_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const RESPONSE_INTERVAL: Duration = Duration::from_millis(50);
+const MAX_IDLE_WAIT: Duration = Duration::from_millis(500);
+const NOTICE_DURATION: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Mode {
@@ -197,12 +200,16 @@ impl App {
         self.refreshing
     }
 
-    pub fn expire_notice(&mut self) {
-        if self.notice.as_ref().is_some_and(|notice| {
-            !notice.is_error && notice.created.elapsed() > Duration::from_secs(3)
-        }) {
+    pub fn expire_notice(&mut self) -> bool {
+        if self
+            .notice
+            .as_ref()
+            .is_some_and(|notice| !notice.is_error && notice.created.elapsed() > NOTICE_DURATION)
+        {
             self.notice = None;
+            return true;
         }
+        false
     }
 
     pub fn is_working(&self) -> bool {
@@ -649,6 +656,7 @@ struct Controller {
     discovery_generation: u64,
     discovery_requested: bool,
     last_poll: Instant,
+    needs_redraw: bool,
     exit_requested: Arc<AtomicBool>,
 }
 
@@ -688,6 +696,7 @@ impl Controller {
             discovery_generation: 0,
             discovery_requested: true,
             last_poll: Instant::now(),
+            needs_redraw: true,
             exit_requested: Arc::default(),
         }
     }
@@ -725,10 +734,37 @@ impl Controller {
         }
     }
 
+    fn input_wait(&self, last_draw: Instant) -> Duration {
+        // Input wakes the poll immediately. Background replies need a short
+        // bound while a command is pending; settled views can wait for timers.
+        let status_pending = self
+            .status_job
+            .as_ref()
+            .is_some_and(|job| !job.is_finished());
+        let mut wait = if status_pending || self.app.busy.is_some() {
+            RESPONSE_INTERVAL
+        } else {
+            MAX_IDLE_WAIT.min(
+                self.poll_interval()
+                    .saturating_sub(self.last_poll.elapsed()),
+            )
+        };
+        if let Some(notice) = &self.app.notice
+            && !notice.is_error
+        {
+            wait = wait.min(NOTICE_DURATION.saturating_sub(notice.created.elapsed()));
+        }
+        if self.app.is_working() {
+            wait = wait.min(ui::SPINNER_INTERVAL.saturating_sub(last_draw.elapsed()));
+        }
+        wait
+    }
+
     fn tick(&mut self) {
-        self.app.expire_notice();
+        self.needs_redraw |= self.app.expire_notice();
         while let Some(result) = self.cache_writer.as_mut().and_then(cache::Writer::poll) {
             self.apply_cache_result(result);
+            self.needs_redraw = true;
         }
         if self.last_poll.elapsed() >= self.poll_interval()
             && self.status_job.as_ref().is_none_or(JoinHandle::is_finished)
@@ -744,6 +780,7 @@ impl Controller {
             self.discovery_requested = false;
             self.discovery_generation += 1;
             self.app.loading = Some((0, 0));
+            self.needs_redraw = true;
             self.discovery_job = Some(self.handle.spawn(discover(
                 self.backend.clone(),
                 self.sender.clone(),
@@ -833,6 +870,7 @@ impl Controller {
             if message.generation != self.generation {
                 continue;
             }
+            self.needs_redraw = true;
             self.apply_event(message.event, terminal)?;
         }
         Ok(!self.exit_requested.load(Ordering::Acquire))
@@ -1288,6 +1326,7 @@ fn run_with_runtime(backend: Backend, runtime: &Runtime) -> Result<()> {
 
 fn run_loop(controller: &mut Controller) -> Result<()> {
     let mut terminal = TerminalSession::new()?;
+    let mut last_draw = Instant::now();
     controller.spawn_status();
     loop {
         // A closed widget no longer has a usable terminal. The bounded input
@@ -1299,16 +1338,30 @@ fn run_loop(controller: &mut Controller) -> Result<()> {
             break;
         }
         controller.tick();
-        terminal
-            .terminal
-            .draw(|frame| ui::render(frame, &mut controller.app))?;
-        if !event::poll(Duration::from_millis(50))? {
+        if controller.needs_redraw
+            || (controller.app.is_working() && last_draw.elapsed() >= ui::SPINNER_INTERVAL)
+        {
+            terminal
+                .terminal
+                .draw(|frame| ui::render(frame, &mut controller.app))?;
+            controller.needs_redraw = false;
+            last_draw = Instant::now();
+        }
+        if !event::poll(controller.input_wait(last_draw))? {
             continue;
         }
         let input = match event::read()? {
-            InputEvent::Key(key) => controller.app.handle_key(key),
+            InputEvent::Key(key) => {
+                controller.needs_redraw = true;
+                controller.app.handle_key(key)
+            }
             InputEvent::Paste(text) => {
+                controller.needs_redraw = true;
                 controller.app.paste(&text);
+                Input::None
+            }
+            InputEvent::Resize(..) => {
+                controller.needs_redraw = true;
                 Input::None
             }
             _ => Input::None,
