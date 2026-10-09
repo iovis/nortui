@@ -64,9 +64,19 @@ pub struct SearchResult {
     pub matches: Vec<u32>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoticeOrigin {
+    General,
+    Status,
+    Cache,
+    Discovery,
+    Action,
+}
+
 pub struct Notice {
     pub message: String,
     pub is_error: bool,
+    pub origin: NoticeOrigin,
     created: Instant,
 }
 
@@ -151,11 +161,31 @@ impl App {
     }
 
     pub fn set_notice(&mut self, message: impl Into<String>, is_error: bool) {
+        self.set_notice_from(NoticeOrigin::General, message, is_error);
+    }
+
+    pub fn set_notice_from(
+        &mut self,
+        origin: NoticeOrigin,
+        message: impl Into<String>,
+        is_error: bool,
+    ) {
         self.notice = Some(Notice {
             message: message.into().replace(['\n', '\r'], " "),
             is_error,
+            origin,
             created: Instant::now(),
         });
+    }
+
+    pub fn clear_notice_from(&mut self, origin: NoticeOrigin) {
+        if self
+            .notice
+            .as_ref()
+            .is_some_and(|notice| notice.origin == origin)
+        {
+            self.notice = None;
+        }
     }
 
     pub fn start_refresh(&mut self) {
@@ -619,7 +649,6 @@ struct Controller {
     discovery_generation: u64,
     discovery_requested: bool,
     last_poll: Instant,
-    status_error: Option<String>,
     exit_requested: Arc<AtomicBool>,
 }
 
@@ -639,7 +668,7 @@ impl Controller {
         let cache_failed = error.is_some();
         let mut app = App::new(catalog.locations());
         if let Some(error) = error {
-            app.set_notice(error, true);
+            app.set_notice_from(NoticeOrigin::Cache, error, true);
         }
         let (sender, receiver) = mpsc::channel();
         Self {
@@ -659,7 +688,6 @@ impl Controller {
             discovery_generation: 0,
             discovery_requested: true,
             last_poll: Instant::now(),
-            status_error: None,
             exit_requested: Arc::default(),
         }
     }
@@ -700,10 +728,7 @@ impl Controller {
     fn tick(&mut self) {
         self.app.expire_notice();
         while let Some(result) = self.cache_writer.as_mut().and_then(cache::Writer::poll) {
-            self.cache_failed = result.is_err();
-            if let Err(error) = result {
-                self.app.set_notice(error, true);
-            }
+            self.apply_cache_result(result);
         }
         if self.last_poll.elapsed() >= self.poll_interval()
             && self.status_job.as_ref().is_none_or(JoinHandle::is_finished)
@@ -767,7 +792,8 @@ impl Controller {
 
     fn start_action(&mut self, action: Action) {
         self.app.action_preparing = false;
-        self.app.set_notice(action.label(), false);
+        self.app
+            .set_notice_from(NoticeOrigin::Action, action.label(), false);
         let backend = self.backend.clone();
         let sender = self.sender.clone();
         let generation = self.generation;
@@ -789,8 +815,12 @@ impl Controller {
         self.app.action_preparing = false;
         self.action_job = None;
         match result {
-            Ok(message) => self.app.set_notice(message, false),
-            Err(message) => self.app.set_notice(message, true),
+            Ok(message) => self
+                .app
+                .set_notice_from(NoticeOrigin::Action, message, false),
+            Err(message) => self
+                .app
+                .set_notice_from(NoticeOrigin::Action, message, true),
         }
         self.spawn_status();
     }
@@ -889,7 +919,10 @@ impl Controller {
                 }
                 self.flush_cache();
                 match outcome {
-                    DiscoveryOutcome::Complete(Some(error)) => self.app.set_notice(error, true),
+                    DiscoveryOutcome::Complete(Some(error)) => {
+                        self.app
+                            .set_notice_from(NoticeOrigin::Discovery, error, true);
+                    }
                     DiscoveryOutcome::Complete(None) => {}
                     DiscoveryOutcome::Interrupted(service) => {
                         self.discovery_requested = true;
@@ -923,14 +956,10 @@ impl Controller {
         };
         let next_error = error.cloned();
         if let Some(error) = error {
-            self.app.set_notice(error.clone(), true);
-        } else if self.status_error.as_ref().is_some_and(|previous| {
             self.app
-                .notice
-                .as_ref()
-                .is_some_and(|notice| notice.message == previous.replace(['\n', '\r'], " "))
-        }) {
-            self.app.notice = None;
+                .set_notice_from(NoticeOrigin::Status, error.clone(), true);
+        } else {
+            self.app.clear_notice_from(NoticeOrigin::Status);
         }
         if refreshed
             && next_error.is_none()
@@ -940,9 +969,9 @@ impl Controller {
                 .as_ref()
                 .is_some_and(|notice| notice.is_error)
         {
-            self.app.set_notice("Status refreshed", false);
+            self.app
+                .set_notice_from(NoticeOrigin::Action, "Status refreshed", false);
         }
-        self.status_error = next_error;
         self.app.set_snapshot(snapshot);
     }
 
@@ -952,6 +981,14 @@ impl Controller {
         }
         if changed || self.cache_failed {
             self.persist_catalog();
+        }
+    }
+
+    fn apply_cache_result(&mut self, result: std::result::Result<(), String>) {
+        self.cache_failed = result.is_err();
+        match result {
+            Ok(()) => self.app.clear_notice_from(NoticeOrigin::Cache),
+            Err(error) => self.app.set_notice_from(NoticeOrigin::Cache, error, true),
         }
     }
 
@@ -2050,6 +2087,59 @@ mod tests {
     }
 
     #[test]
+    fn successful_recovery_clears_only_notices_from_the_recovered_source() {
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let mut controller = Controller::new(Backend::new(), runtime.handle().clone());
+        let healthy = Snapshot {
+            service: ServiceState::Inactive,
+            vpn: None,
+        };
+        controller.apply_status(Err("Same error\ntext".into()));
+        assert_eq!(
+            controller.app.notice.as_ref().unwrap().origin,
+            NoticeOrigin::Status
+        );
+        controller
+            .app
+            .set_notice_from(NoticeOrigin::Action, "Same error\ntext", true);
+        controller.apply_status(Ok(healthy.clone()));
+        assert_eq!(
+            controller.app.notice.as_ref().unwrap().origin,
+            NoticeOrigin::Action
+        );
+
+        controller.apply_cache_result(Err("Cannot save cache".into()));
+        controller.apply_status(Ok(healthy));
+        assert!(controller.cache_failed);
+        assert_eq!(
+            controller.app.notice.as_ref().unwrap().origin,
+            NoticeOrigin::Cache
+        );
+        controller.apply_cache_result(Ok(()));
+        assert!(!controller.cache_failed);
+        assert!(controller.app.notice.is_none());
+
+        for origin in [
+            NoticeOrigin::General,
+            NoticeOrigin::Status,
+            NoticeOrigin::Action,
+            NoticeOrigin::Discovery,
+        ] {
+            controller
+                .app
+                .set_notice_from(origin, "Unrelated error", true);
+            controller.apply_cache_result(Ok(()));
+            assert_eq!(controller.app.notice.as_ref().unwrap().origin, origin);
+        }
+        controller.apply_status(Err("Status error".into()));
+        controller.apply_status(Ok(Snapshot {
+            service: ServiceState::Inactive,
+            vpn: None,
+        }));
+        assert!(controller.app.notice.is_none());
+    }
+
+    #[test]
     fn status_polling_uses_one_second_only_for_the_observed_connected_state() {
         let runtime = Builder::new_current_thread().enable_all().build().unwrap();
         let mut controller = Controller::new(Backend::new(), runtime.handle().clone());
@@ -2108,6 +2198,14 @@ mod tests {
             "Status refreshed"
         );
         assert!(!controller.app.is_working());
+        controller.apply_status(Ok(Snapshot {
+            service: ServiceState::Inactive,
+            vpn: None,
+        }));
+        assert_eq!(
+            controller.app.notice.as_ref().unwrap().message,
+            "Status refreshed"
+        );
         controller.execute(Action::Refresh);
         controller.apply_status(Err("Cannot query systemd".into()));
         let notice = controller.app.notice.as_ref().unwrap();

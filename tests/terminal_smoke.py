@@ -207,7 +207,7 @@ class Screen:
 
 
 class Widget:
-    def __init__(self, service="inactive", cached=False, vpn="Disconnected", width=100, height=24, **environment):
+    def __init__(self, service="inactive", cached=False, vpn="Disconnected", width=100, height=24, corrupt_cache=False, cache_blocked=False, **environment):
         self.directory = tempfile.TemporaryDirectory(prefix="nortui-terminal-")
         self.root = Path(self.directory.name)
         (self.root / "service").write_text(service)
@@ -216,10 +216,15 @@ class Widget:
             path = self.root / program
             path.write_text(FAKE)
             path.chmod(0o700)
-        if cached:
+        if cached or corrupt_cache:
             path = self.root / "cache/nortui/locations.json"
             path.parent.mkdir(parents=True)
             path.write_text(json.dumps({"version": 1, "updated_at": 0, "countries": {"United_States": ["New_York"]}}))
+            if corrupt_cache:
+                path.write_text("invalid JSON")
+        if cache_blocked:
+            (self.root / "cache").mkdir()
+            (self.root / "cache/nortui").write_text("not a directory")
         self.master, self.slave = os.openpty()
         fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack("HHHH", height, width, 0, 0))
         self.original_attributes = termios.tcgetattr(self.slave)
@@ -822,6 +827,28 @@ class TerminalSmoke(unittest.TestCase):
                     ["nordvpn", "cities", "Japan"],
                     ["nordvpn", "cities", "Monaco"],
                 ])
+
+    def test_successful_discovery_replaces_corrupt_cache_and_clears_its_warning(self):
+        widget = self.widget(service="active", corrupt_cache=True)
+        widget.wait_for(lambda: "Invalid location cache" in widget.text() and "Ready to connect" in widget.text())
+        widget.send(b"i")
+        cache = widget.root / "cache/nortui/locations.json"
+        widget.wait_for(lambda: "Tokyo / Japan" in widget.text() and "Loading" not in widget.footer() and "Invalid location cache" not in widget.text())
+        data = json.loads(cache.read_text())
+        self.assertEqual(data["countries"]["United_States"], ["Los_Angeles", "New_York"])
+        self.assertEqual(data["countries"]["Japan"], ["Tokyo"])
+
+    def test_failed_cache_save_warning_remains_until_a_successful_background_retry(self):
+        widget = self.widget(service="active", cache_blocked=True, NORTUI_CITY_DELAY="1.5")
+        widget.wait_for(lambda: "Ready to connect" in widget.text())
+        widget.send(b"i")
+        widget.wait_for(lambda: "Cannot create location cache directory" in widget.text())
+        blocked = widget.root / "cache/nortui"
+        blocked.unlink()
+        widget.pump(0.15)
+        self.assertIn("Cannot create location cache directory", widget.text())
+        widget.wait_for(lambda: "Tokyo / Japan" in widget.text() and "Loading" not in widget.footer() and "Cannot create location cache directory" not in widget.text())
+        self.assertEqual(json.loads((blocked / "locations.json").read_text())["countries"]["Japan"], ["Tokyo"])
 
     def test_quitting_discovery_flushes_latest_partial_catalog_and_reaps_children(self):
         widget = self.widget(service="active", NORTUI_JAPAN_CITY_DELAY="10")
