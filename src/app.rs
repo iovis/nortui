@@ -29,7 +29,7 @@ use crate::model::{Action, Location, ServiceState, Snapshot, VpnState};
 use crate::ui;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
-const REFRESH_NOTICE: &str = "Refreshing status and locations…";
+const REFRESH_NOTICE: &str = "Refreshing status…";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Mode {
@@ -445,7 +445,7 @@ impl Controller {
             Err(error) => (
                 Catalog::default(),
                 Some(format!(
-                    "{error}; locations will reload when the service starts"
+                    "{error}; locations will reload when you open search"
                 )),
             ),
         };
@@ -498,6 +498,7 @@ impl Controller {
             self.spawn_status();
         }
         if self.discovery_requested
+            && self.app.mode == Mode::Search
             && self.app.busy.is_none()
             && self.app.snapshot.service == ServiceState::Active
             && self.discovery_job.is_none()
@@ -644,12 +645,8 @@ impl Controller {
                 vpn: None,
             },
         };
-        if snapshot.service == ServiceState::Active
-            && self.app.snapshot.service != ServiceState::Active
-        {
-            self.discovery_requested = true;
-        }
         if snapshot.service != ServiceState::Active {
+            self.discovery_requested |= self.discovery_job.is_some();
             abort(&mut self.discovery_job);
             self.app.loading = None;
         }

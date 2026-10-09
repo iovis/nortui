@@ -66,6 +66,7 @@ elif name == "nordvpn":
         if args[1] == "Monaco":
             print("Servers by city are not available for this country.", file=sys.stderr)
             sys.exit(1)
+        (root / f"city-{args[1]}.pid").write_text(str(os.getpid()))
         time.sleep(float(os.environ.get("NORTUI_CITY_DELAY", "0")))
         print("New_York\nLos_Angeles" if args[1] == "United_States" else "Tokyo")
     elif args[0] == "connect":
@@ -225,6 +226,9 @@ class Widget:
         path = self.root / "commands.jsonl"
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
+    def location_commands(self):
+        return [command for command in self.commands() if command[0] == "nordvpn" and command[1] in ("countries", "cities")]
+
     def close(self):
         if self.process.poll() is None:
             if self.master is not None:
@@ -255,7 +259,7 @@ class TerminalSmoke(unittest.TestCase):
     def test_stopped_launch_search_and_escape_restore_terminal(self):
         widget = self.widget()
         widget.wait_for(lambda: "Service stopped" in widget.text())
-        self.assertIn("Start service to load locations", widget.text())
+        self.assertIn("Start service, then open search to load locations.", widget.text())
         self.assertIn("VPN is off", widget.text())
         self.assertNotIn("Technology", widget.text())
         self.assertNotIn("—", widget.text())
@@ -265,6 +269,7 @@ class TerminalSmoke(unittest.TestCase):
         widget.send(b"iq")
         widget.wait_for(lambda: "No matches" in widget.text())
         self.assertTrue(widget.screen.cursor_visible)
+        self.assertFalse(any(command[0] == "nordvpn" for command in widget.commands()))
         widget.send(b"\x1b")
         widget.wait_for(lambda: "VPN is off" in widget.text())
         self.assertFalse(widget.screen.cursor_visible)
@@ -353,7 +358,11 @@ class TerminalSmoke(unittest.TestCase):
     def test_external_service_stop_and_refresh_do_not_query_vpn(self):
         widget = self.widget(service="active")
         widget.wait_for(lambda: "Disconnected" in widget.text())
-        widget.wait_for(lambda: (widget.root / "cache/nortui/locations.json").exists())
+        widget.send(b"i")
+        cache = widget.root / "cache/nortui/locations.json"
+        widget.wait_for(lambda: cache.exists() and "Tokyo" in cache.read_text() and "Loading" not in widget.footer())
+        widget.send(b"\x1b")
+        widget.wait_for(lambda: "Ready to connect" in widget.text())
         (widget.root / "service").write_text("inactive")
         widget.wait_for(lambda: "Service stopped" in widget.text())
         before = sum(command[0] == "nordvpn" for command in widget.commands())
@@ -366,13 +375,16 @@ class TerminalSmoke(unittest.TestCase):
 
     def test_city_loading_spinner_animates_while_searching_and_disappears_when_done(self):
         widget = self.widget(service="active", cached=True, NORTUI_CITY_DELAY="1")
+        widget.wait_for(lambda: "Disconnected" in widget.footer())
+        self.assertEqual(widget.location_commands(), [])
+        widget.send(b"i")
         widget.wait_for(lambda: "Loading cities" in widget.footer())
         first = widget.footer().lstrip()[0]
         self.assertIn(first, SPINNER_FRAMES)
         self.assertIn("/3 countries", widget.footer())
         self.assertTrue(widget.footer().endswith("● Disconnected "))
 
-        widget.send(b"/new")
+        widget.send(b"new")
         widget.wait_for(lambda: widget.query() == "new")
         widget.wait_for(lambda: widget.footer().lstrip()[0] != first, timeout=0.5)
         self.assertIn(widget.footer().lstrip()[0], SPINNER_FRAMES)
@@ -382,6 +394,111 @@ class TerminalSmoke(unittest.TestCase):
         self.assertFalse(any(frame in widget.footer() for frame in SPINNER_FRAMES))
         self.assertEqual(widget.query(), "new")
         self.assertTrue(widget.footer().endswith("● Disconnected "))
+
+    def test_panel_launch_service_start_and_refresh_defer_locations_until_search(self):
+        for service, trigger in (("active", b"i"), ("inactive", b"/")):
+            with self.subTest(initial_service=service, search_trigger=trigger):
+                widget = self.widget(service=service, cached=True, NORTUI_CITY_DELAY="1")
+                (widget.root / "credentials").touch()
+                if service == "inactive":
+                    widget.wait_for(lambda: widget.footer().endswith("● Service stopped "))
+                    widget.send(b"s")
+                widget.wait_for(lambda: widget.footer().endswith("● Disconnected "))
+                widget.pump(0.15)
+                self.assertEqual(widget.location_commands(), [])
+                widget.send(b"r")
+                widget.wait_for(lambda: "Status refreshed" in widget.footer())
+                self.assertEqual(widget.location_commands(), [])
+                self.assertNotIn("Loading", widget.footer())
+
+                widget.send(trigger + b"new")
+                widget.wait_for(lambda: widget.query() == "new" and "Loading cities" in widget.footer())
+                self.assertIn("New York / United States", widget.text())
+                cache = widget.root / "cache/nortui/locations.json"
+                self.assertNotIn("Tokyo", cache.read_text())
+                widget.wait_for(lambda: "Tokyo" in cache.read_text() and "Loading" not in widget.footer())
+                self.assertEqual(widget.query(), "new")
+                self.assertCountEqual(widget.location_commands(), [
+                    ["nordvpn", "countries"],
+                    ["nordvpn", "cities", "United_States"],
+                    ["nordvpn", "cities", "Japan"],
+                    ["nordvpn", "cities", "Monaco"],
+                ])
+
+    def test_completed_search_catalog_survives_reopening_restart_and_refresh(self):
+        widget = self.widget(service="active")
+        (widget.root / "credentials").touch()
+        widget.wait_for(lambda: widget.footer().endswith("● Disconnected "))
+        widget.send(b"i")
+        cache = widget.root / "cache/nortui/locations.json"
+        widget.wait_for(lambda: cache.exists() and "Tokyo" in cache.read_text() and "Loading" not in widget.footer())
+        first = widget.location_commands()
+        self.assertEqual(len(first), 4)
+
+        widget.send(b"\x1b")
+        widget.wait_for(lambda: "Ready to connect" in widget.text())
+        widget.send(b"/tokyo")
+        widget.wait_for(lambda: widget.query() == "tokyo" and "Tokyo / Japan" in widget.text())
+        widget.pump(0.15)
+        self.assertEqual(widget.location_commands(), first)
+        widget.send(b"\x1b")
+        widget.wait_for(lambda: "Ready to connect" in widget.text())
+        widget.send(b"s")
+        widget.wait_for(lambda: widget.footer().endswith("● Service stopped "))
+        widget.send(b"s")
+        widget.wait_for(lambda: widget.footer().endswith("● Disconnected "))
+        widget.pump(0.15)
+        self.assertEqual(widget.location_commands(), first)
+        widget.send(b"i")
+        widget.wait_for(lambda: widget.query() == "Search countries and cities…")
+        widget.pump(0.15)
+        self.assertEqual(widget.location_commands(), first)
+
+        widget.send(b"\x12")
+        widget.wait_for(lambda: len(widget.location_commands()) == 8 and "Loading" not in widget.footer())
+        self.assertCountEqual(widget.location_commands(), first * 2)
+        widget.send(b"\x1b")
+        widget.wait_for(lambda: "Ready to connect" in widget.text())
+        widget.send(b"r")
+        widget.wait_for(lambda: "Status refreshed" in widget.footer())
+        widget.pump(0.15)
+        self.assertCountEqual(widget.location_commands(), first * 2)
+        widget.send(b"/")
+        widget.wait_for(lambda: len(widget.location_commands()) == 12 and "Loading" not in widget.footer())
+        self.assertCountEqual(widget.location_commands(), first * 3)
+
+    def test_interrupted_city_loading_retries_only_when_search_opens_again(self):
+        for stop_source, delay in (("shortcut", "1.5"), ("external", "3")):
+            with self.subTest(stop_source=stop_source):
+                widget = self.widget(service="active", cached=True, NORTUI_CITY_DELAY=delay)
+                (widget.root / "credentials").touch()
+                widget.wait_for(lambda: widget.footer().endswith("● Disconnected "))
+                widget.send(b"/new")
+                workers = [widget.root / f"city-{country}.pid" for country in ("United_States", "Japan")]
+                widget.wait_for(lambda: all(path.exists() for path in workers) and len(widget.location_commands()) == 4 and "Loading cities" in widget.footer())
+                pids = [int(path.read_text()) for path in workers]
+                widget.send(b"\x1b")
+                widget.wait_for(lambda: "Ready to connect" in widget.text())
+                self.assertIn("Loading cities", widget.footer())
+                if stop_source == "shortcut":
+                    widget.send(b"s")
+                else:
+                    (widget.root / "service").write_text("inactive")
+                widget.wait_for(lambda: widget.footer().endswith("● Service stopped "))
+                widget.wait_for(lambda: all(not Path(f"/proc/{pid}").exists() for pid in pids))
+                before = widget.location_commands()
+                widget.send(b"s")
+                widget.wait_for(lambda: widget.footer().endswith("● Disconnected "))
+                widget.pump(0.15)
+                self.assertEqual(widget.location_commands(), before)
+                self.assertNotIn("Loading", widget.footer())
+
+                widget.send(b"/new")
+                widget.wait_for(lambda: widget.query() == "new" and "Loading cities" in widget.footer())
+                self.assertIn("New York / United States", widget.text())
+                cache = widget.root / "cache/nortui/locations.json"
+                widget.wait_for(lambda: "Tokyo" in cache.read_text() and "Loading" not in widget.footer())
+                self.assertCountEqual(widget.location_commands(), before * 2)
 
     def test_sigterm_restores_terminal(self):
         widget = self.widget()
@@ -419,9 +536,11 @@ class TerminalSmoke(unittest.TestCase):
         widget.wait_for(lambda: "Service stopped" in widget.text())
         widget.send(b"s")
         widget.wait_for(lambda: "Disconnected" in widget.text())
+        self.assertEqual(widget.location_commands(), [])
+        widget.send(b"/")
         cache = widget.root / "cache/nortui/locations.json"
-        widget.wait_for(lambda: cache.exists() and "Tokyo" in cache.read_text())
-        widget.send(b"/united states\r")
+        widget.wait_for(lambda: cache.exists() and "Tokyo" in cache.read_text() and "Loading" not in widget.footer())
+        widget.send(b"united states\r")
         widget.wait_for(lambda: "Connected" in widget.text() and "You are connected" in widget.text())
         self.assertIn(["nordvpn", "connect", "United_States"], widget.commands())
         widget.send(b"c")
@@ -481,6 +600,7 @@ class TerminalSmoke(unittest.TestCase):
         self.assertIn(["nordvpn", "connect"], commands)
         self.assertLess(commands.index(["systemctl", "start", "nordvpnd.service"]), commands.index(["nordvpn", "connect"]))
         self.assertNotIn("Search countries", widget.text())
+        self.assertEqual(widget.location_commands(), [])
 
     def test_connected_hierarchy_and_footer_stay_cohesive_when_searching(self):
         widget = self.widget(service="active", cached=True, vpn="Connected")

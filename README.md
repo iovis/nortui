@@ -23,7 +23,7 @@ The widget opens on a connection view with a prominent city and secondary countr
 | c | Connect or reconnect |
 | d | Disconnect |
 | s | Start or stop the service |
-| r | Refresh status and locations |
+| r | Refresh status; reload locations on next search |
 | q or Escape | Close |
 
 In location search, countries appear first and cities second when the query is empty. Type to fuzzy find either; city results include their country. Ordinary letters always become search input, including panel shortcut letters.
@@ -33,16 +33,19 @@ In location search, countries appear first and cities second when the query is e
 | ↑ / ↓, Ctrl-K / Ctrl-J, or Ctrl-P / Ctrl-N | Select a result |
 | Page Up / Page Down | Move ten results |
 | Enter | Connect to the selected location and return to the panel |
+| Ctrl-R | Refresh status and reload locations |
 | Ctrl-U | Clear search |
 | Escape | Cancel search and return to the panel |
 
-Ctrl-C closes and Ctrl-R refreshes in either mode. The panel has no persistent key legend.
+Ctrl-C closes in either mode. Ctrl-R refreshes status in either mode and reloads locations immediately in search, or on the next search when used from the panel. The panel has no persistent key legend.
 
 **Connect** starts `nordvpnd.service` when necessary, then runs `nordvpn connect`. **Reconnect** also runs exactly `nordvpn connect`, allowing NordVPN to choose the recommended server again. **Disconnect** leaves the service running; **Stop service** stops it. The widget preserves the service's enabled/disabled configuration, and closing it preserves your connection and service state.
 
 When service control needs authentication, nortui temporarily restores normal terminal input for `sudo -v` inside the widget's alternate screen, then redraws the widget. Closing restores your original terminal contents without bringing back the sudo prompt. Selecting a location returns to the panel before connecting or authenticating. It never reads or stores your password.
 
-Status refreshes every two seconds. Countries and cities load progressively while the service runs and are cached at `$XDG_CACHE_HOME/nortui/locations.json` (normally `~/.cache/nortui/locations.json`). A braille-dot spinner accompanies loading progress and pending actions in the footer, disappearing when the work finishes. Cached locations remain searchable while the service is stopped. On a first launch with no cache, press **s** to start the service and load locations, or **c** to start and connect immediately. Refreshing does not start a stopped service. The service toggle waits for an observed state; if state is unavailable or changing, it reports that instead of guessing.
+Status refreshes every two seconds. Opening location search for the first time in each app session refreshes countries and cities in the background while the service runs. Cached names appear immediately, including when the service is stopped. Locations are cached at `$XDG_CACHE_HOME/nortui/locations.json` (normally `~/.cache/nortui/locations.json`). A completed location list is reused when search is reopened or the service is restarted, until you explicitly refresh it. Opening the panel, starting the service, and refreshing from the panel do not load locations until you open search.
+
+Locations arrive progressively, with a braille-dot spinner beside loading progress in the footer. A requested load can finish after you return to the panel; an interrupted load waits for search before restarting. Pending actions use the same spinner, which disappears when the work finishes. On a first launch with no cache, press **s** to start the service, then **i** or **/** to open search and load locations. **c** starts the service and connects immediately to a recommended server. Refreshing does not start a stopped service. The service toggle waits for an observed state; if state is unavailable or changing, it reports that instead of guessing.
 
 The footer uses the same compact layout in the panel and location picker: service information or current activity on the left, gray connection status with one padding cell on the right. Its circle is green when connected, red when disconnected, yellow when connecting or paused, and gray when the service is stopped. The panel hides stale connection details and omits unavailable metadata. The interface uses Catppuccin Frappé with a transparent terminal background and a #232634 selection highlight, with matching margins in both views. Commands run in the background; progress and success notices appear in the footer. Errors get a separate red row above the separator when needed. A failed command preserves the interface and reports its error. NordVPN queries require access to its daemon, typically through membership in the `nordvpn` group. Unknown status output is shown as unavailable.
 

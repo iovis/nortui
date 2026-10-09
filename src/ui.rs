@@ -100,7 +100,7 @@ fn panel_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             if app.locations.is_empty() {
                 lines.push(Line::default());
                 lines.extend(wrapped_lines(
-                    "Start service to load locations",
+                    "Start service, then open search to load locations.",
                     width,
                     GRAY,
                 ));
@@ -307,7 +307,7 @@ fn render_search(frame: &mut Frame, app: &mut App, area: Rect) {
             let guidance = Rect::new(results.x, results.y + 1, results.width, results.height - 1);
             frame.render_widget(
                 Paragraph::new(wrapped_lines(
-                    "Start service to load locations",
+                    "Start service, then reopen search.",
                     guidance.width,
                     GRAY,
                 )),
@@ -567,13 +567,16 @@ mod tests {
         for expected in [
             "VPN is off",
             "Connect when you need it.",
-            "Start service to load locations",
+            "Start service, then open search to load locations.",
             "Service stopped",
         ] {
             assert!(text(&stopped).contains(expected));
         }
         app.set_locations(vec![country()]);
-        assert!(!text(&terminal(&mut app, 80, 12)).contains("Start service to load locations"));
+        assert!(
+            !text(&terminal(&mut app, 80, 12))
+                .contains("Start service, then open search to load locations.")
+        );
         let mut snapshot = connected();
         snapshot.vpn.as_mut().unwrap().state = VpnState::Disconnected;
         app.set_snapshot(snapshot);
