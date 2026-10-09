@@ -48,6 +48,7 @@ elif name == "sudo":
         time.sleep(float(os.environ.get("NORTUI_CREDENTIAL_DELAY", "0")))
         sys.exit(0 if (root / "credentials").exists() else 1)
     if args == ["-v"]:
+        (root / "auth.pid").write_text(str(os.getpid()))
         flags = termios.tcgetattr(0)[3]
         assert flags & termios.ICANON and flags & termios.ECHO, "sudo received raw terminal"
         print("AUTH_COOKED password: ", end="", flush=True)
@@ -626,6 +627,46 @@ class TerminalSmoke(unittest.TestCase):
                     self.assertNotIn("AUTH_COOKED", restored)
                 self.assertEqual(widget.text(), original_primary)
                 self.assertEqual(termios.tcgetattr(widget.slave)[3], widget.original_flags)
+
+    def test_signals_during_authentication_exit_and_reap_without_running_action(self):
+        for exit_signal in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            with self.subTest(signal=exit_signal):
+                widget = self.widget(cached=True)
+                widget.wait_for(lambda: "Service stopped" in widget.text())
+                shell = "Existing shell output"
+                widget.screen.primary_rows[0][:len(shell)] = list(shell)
+                original_primary = "\n".join("".join(row) for row in widget.screen.primary_rows)
+                widget.send(b"c")
+                widget.wait_for(lambda: "AUTH_COOKED" in widget.text())
+                pid = int((widget.root / "auth.pid").read_text())
+                self.assertTrue(Path(f"/proc/{pid}").exists())
+                widget.process.send_signal(exit_signal)
+                self.assertEqual(widget.process.wait(timeout=3), 0)
+                widget.pump()
+                self.assertFalse(Path(f"/proc/{pid}").exists())
+                self.assertEqual((widget.root / "service").read_text(), "inactive")
+                self.assertFalse(any(command[:2] in (["nordvpn", "connect"], ["systemctl", "start"]) for command in widget.commands()))
+                self.assertFalse((widget.root / "credentials").exists())
+                self.assertEqual(termios.tcgetattr(widget.slave)[3], widget.original_flags)
+                self.assertFalse(widget.screen.alternate_active)
+                self.assertTrue(widget.screen.restored_screens)
+                for restored in widget.screen.restored_screens:
+                    self.assertEqual(restored, original_primary)
+                    self.assertNotIn("AUTH_COOKED", restored)
+                self.assertEqual(widget.text(), original_primary)
+
+    def test_closing_terminal_during_authentication_reaps_without_running_action(self):
+        widget = self.widget(cached=True)
+        widget.wait_for(lambda: "Service stopped" in widget.text())
+        widget.send(b"c")
+        widget.wait_for(lambda: "AUTH_COOKED" in widget.text())
+        pid = int((widget.root / "auth.pid").read_text())
+        os.close(widget.master)
+        widget.master = None
+        self.assertEqual(widget.process.wait(timeout=3), 0)
+        self.assertFalse(Path(f"/proc/{pid}").exists())
+        self.assertEqual((widget.root / "service").read_text(), "inactive")
+        self.assertFalse(any(command[:2] in (["nordvpn", "connect"], ["systemctl", "start"]) for command in widget.commands()))
 
     def test_slow_connection_keeps_search_responsive_and_exit_reaps_child(self):
         widget = self.widget(service="active", cached=True, NORTUI_CONNECT_DELAY="10")

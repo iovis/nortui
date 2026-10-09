@@ -1,5 +1,6 @@
 use std::{
     ffi::{OsStr, OsString},
+    future::Future,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::{Arc, Mutex},
@@ -30,6 +31,12 @@ pub struct Backend {
     reapers: Reapers,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum Authentication {
+    Completed,
+    Canceled,
+}
+
 #[derive(Clone, Debug, Default)]
 struct Reapers {
     state: Arc<Mutex<ProcessState>>,
@@ -46,6 +53,20 @@ struct ProcessState {
 struct ManagedChild {
     child: Option<Child>,
     reapers: Reapers,
+}
+
+impl ManagedChild {
+    fn new(reapers: &Reapers) -> Result<Self> {
+        let mut state = reapers.state.lock().expect("Reaper lock poisoned");
+        if state.closing {
+            bail!("The command backend is shutting down");
+        }
+        state.active += 1;
+        Ok(Self {
+            child: None,
+            reapers: reapers.clone(),
+        })
+    }
 }
 
 impl Drop for ManagedChild {
@@ -226,19 +247,40 @@ impl Backend {
     }
 
     /// Run only after the caller has restored the terminal to ordinary input mode.
-    pub fn authenticate(&self) -> Result<()> {
-        let status = std::process::Command::new(&self.sudo)
-            .arg("-v")
-            .env("LC_ALL", "C")
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .context("Could not run sudo authentication")?;
+    pub async fn authenticate(&self, canceled: impl Future<Output = ()>) -> Result<Authentication> {
+        let mut managed = ManagedChild::new(&self.reapers)?;
+        managed.child = Some(
+            Command::new(&self.sudo)
+                .arg("-v")
+                .env("LC_ALL", "C")
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .kill_on_drop(true)
+                .spawn()
+                .context("Could not run sudo authentication")?,
+        );
+        let child = managed
+            .child
+            .as_mut()
+            .expect("Authentication child is present");
+        let status = tokio::select! {
+            biased;
+            () = canceled => {
+                let killed = child.kill().await;
+                let reaped = child.wait().await;
+                if reaped.is_err() {
+                    killed.context("Could not kill canceled sudo authentication")?;
+                    reaped.context("Could not reap canceled sudo authentication")?;
+                }
+                return Ok(Authentication::Canceled);
+            }
+            status = child.wait() => status.context("Could not wait for sudo authentication")?,
+        };
         if !status.success() {
             bail!("Sudo authentication was canceled or failed ({status})");
         }
-        Ok(())
+        Ok(Authentication::Completed)
     }
 
     pub async fn execute(&self, action: &Action) -> Result<String> {
@@ -342,17 +384,7 @@ async fn capture<S: AsRef<OsStr>>(
     limit: Duration,
     reapers: &Reapers,
 ) -> Result<Captured> {
-    {
-        let mut state = reapers.state.lock().expect("Reaper lock poisoned");
-        if state.closing {
-            bail!("The command backend is shutting down");
-        }
-        state.active += 1;
-    }
-    let mut managed = ManagedChild {
-        child: None,
-        reapers: reapers.clone(),
-    };
+    let mut managed = ManagedChild::new(reapers)?;
     let arguments: Vec<OsString> = arguments
         .iter()
         .map(|argument| argument.as_ref().to_owned())
@@ -1124,10 +1156,100 @@ esac
         fixture.mark("no-credentials");
         assert!(!fixture.backend.has_credentials().await.unwrap());
         assert!(fixture.log().contains("sudo|-n|-v"));
-        fixture.backend.authenticate().unwrap();
+        assert_eq!(
+            fixture
+                .backend
+                .authenticate(std::future::pending())
+                .await
+                .unwrap(),
+            Authentication::Completed
+        );
         fixture.mark("auth-fails");
-        assert!(fixture.backend.authenticate().is_err());
+        assert!(
+            fixture
+                .backend
+                .authenticate(std::future::pending())
+                .await
+                .is_err()
+        );
         assert!(fixture.log().contains("sudo|-v"));
+    }
+
+    #[tokio::test]
+    async fn canceling_authentication_kills_and_reaps_without_running_an_action() {
+        let fixture = Fixture::new("inactive");
+        program(
+            fixture.directory.path(),
+            "sudo",
+            "printf 'sudo|-v\\n' >> \"$root/log\"\nprintf '%s' \"$$\" > \"$root/pid\"\nexec sleep 30\n",
+        );
+        let pid_file = fixture.directory.path().join("pid");
+        let canceled = async {
+            while !pid_file.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        let result = timeout(
+            Duration::from_secs(2),
+            fixture.backend.authenticate(canceled),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result, Authentication::Canceled);
+        let pid = fs::read_to_string(pid_file).unwrap();
+        assert!(!Path::new("/proc").join(pid).exists());
+        assert_eq!(fixture.log(), "sudo|-v\n");
+        assert_eq!(
+            fs::read_to_string(fixture.directory.path().join("state")).unwrap(),
+            "inactive"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_existing_exit_request_takes_precedence_over_authentication() {
+        let fixture = Fixture::new("inactive");
+        assert_eq!(
+            fixture
+                .backend
+                .authenticate(std::future::ready(()))
+                .await
+                .unwrap(),
+            Authentication::Canceled
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_reaps_authentication_if_its_future_is_aborted() {
+        let fixture = Fixture::new("inactive");
+        program(
+            fixture.directory.path(),
+            "sudo",
+            "printf '%s' \"$$\" > \"$root/pid\"\nexec sleep 30\n",
+        );
+        let backend = fixture.backend.clone();
+        let job = tokio::spawn(async move { backend.authenticate(std::future::pending()).await });
+        let pid_file = fixture.directory.path().join("pid");
+        timeout(Duration::from_secs(2), async {
+            while !pid_file.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let pid = fs::read_to_string(pid_file).unwrap();
+        job.abort();
+        assert!(job.await.unwrap_err().is_cancelled());
+        timeout(Duration::from_secs(2), fixture.backend.reap_canceled())
+            .await
+            .unwrap();
+        assert!(!Path::new("/proc").join(pid).exists());
+        let error = fixture
+            .backend
+            .authenticate(std::future::pending())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("shutting down"));
     }
 
     #[tokio::test]

@@ -1,6 +1,7 @@
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -23,7 +24,7 @@ use tokio::runtime::{Builder, Handle, Runtime};
 use tokio::task::JoinHandle;
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::backend::Backend;
+use crate::backend::{Authentication, Backend};
 use crate::cache::{self, Catalog};
 use crate::model::{Action, Location, ServiceState, Snapshot, VpnState};
 use crate::ui;
@@ -605,6 +606,7 @@ struct Controller {
     discovery_requested: bool,
     last_poll: Instant,
     status_error: Option<String>,
+    exit_requested: Arc<AtomicBool>,
 }
 
 impl Controller {
@@ -640,6 +642,7 @@ impl Controller {
             discovery_requested: true,
             last_poll: Instant::now(),
             status_error: None,
+            exit_requested: Arc::default(),
         }
     }
 
@@ -768,7 +771,7 @@ impl Controller {
 
     fn receive(&mut self, terminal: &mut TerminalSession) -> Result<bool> {
         while let Ok(message) = self.receiver.try_recv() {
-            if matches!(message.event, Event::Exit) {
+            if self.exit_requested.load(Ordering::Acquire) || matches!(message.event, Event::Exit) {
                 return Ok(false);
             }
             if message.generation != self.generation {
@@ -776,7 +779,7 @@ impl Controller {
             }
             self.apply_event(message.event, terminal)?;
         }
-        Ok(true)
+        Ok(!self.exit_requested.load(Ordering::Acquire))
     }
 
     fn apply_event(&mut self, event: Event, terminal: &mut TerminalSession) -> Result<()> {
@@ -788,13 +791,32 @@ impl Controller {
             } => {
                 if authenticate {
                     // No Crossterm input reader runs while sudo owns the terminal.
-                    let result = terminal.suspend(|| self.backend.authenticate())?;
-                    if let Err(error) = result {
-                        self.finish_action(Err(format!("{error:#}")));
-                        return Ok(());
+                    let result = terminal.suspend(|| {
+                        self.handle.block_on(self.backend.authenticate(async {
+                            loop {
+                                if self.exit_requested.load(Ordering::Acquire)
+                                    || !io::stdin().is_terminal()
+                                    || !io::stdout().is_terminal()
+                                {
+                                    self.exit_requested.store(true, Ordering::Release);
+                                    break;
+                                }
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            }
+                        }))
+                    })?;
+                    match result {
+                        Ok(Authentication::Completed) => {}
+                        Ok(Authentication::Canceled) => return Ok(()),
+                        Err(error) => {
+                            self.finish_action(Err(format!("{error:#}")));
+                            return Ok(());
+                        }
                     }
                 }
-                self.start_action(action);
+                if !self.exit_requested.load(Ordering::Acquire) {
+                    self.start_action(action);
+                }
             }
             Event::Finished(result) => self.finish_action(result),
             Event::Countries(countries) => {
@@ -1097,7 +1119,11 @@ pub fn run(backend: Backend) -> Result<()> {
 
 fn run_with_runtime(backend: Backend, runtime: &Runtime) -> Result<()> {
     let mut controller = Controller::new(backend, runtime.handle().clone());
-    let signal_job = install_signals(runtime.handle(), controller.sender.clone())?;
+    let signal_job = install_signals(
+        runtime.handle(),
+        controller.sender.clone(),
+        controller.exit_requested.clone(),
+    )?;
     let result = run_loop(&mut controller);
     signal_job.abort();
     runtime.block_on(async {
@@ -1148,7 +1174,11 @@ fn run_loop(controller: &mut Controller) -> Result<()> {
     Ok(())
 }
 
-fn install_signals(handle: &Handle, sender: Sender<Message>) -> Result<JoinHandle<()>> {
+fn install_signals(
+    handle: &Handle,
+    sender: Sender<Message>,
+    exit_requested: Arc<AtomicBool>,
+) -> Result<JoinHandle<()>> {
     use tokio::signal::unix::{SignalKind, signal};
     let _guard = handle.enter();
     let mut termination = signal(SignalKind::terminate())?;
@@ -1160,6 +1190,7 @@ fn install_signals(handle: &Handle, sender: Sender<Message>) -> Result<JoinHandl
             _ = hangup.recv() => {},
             _ = interrupt.recv() => {},
         }
+        exit_requested.store(true, Ordering::Release);
         let _ = sender.send(Message {
             generation: 0,
             event: Event::Exit,
