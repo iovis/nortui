@@ -457,9 +457,6 @@ fn footer_activity(app: &App) -> (String, Color) {
     if let Some(notice) = app.notice.as_ref().filter(|notice| !notice.is_error) {
         return (notice.message.clone(), GRAY);
     }
-    if app.snapshot.service == ServiceState::Active {
-        return ("Service running".into(), GRAY);
-    }
     (String::new(), GRAY)
 }
 
@@ -887,8 +884,6 @@ mod tests {
                     assert!(SPINNER_FRAMES.contains(&buffer[(2, 11)].symbol()));
                     assert_eq!(buffer[(2, 11)].fg, GRAY);
                     assert!(footer.contains('…'));
-                } else if app.snapshot.service == ServiceState::Active {
-                    assert!(footer.starts_with("  Service running"));
                 } else {
                     assert!(footer[..usize::from(circle_x)].trim().is_empty());
                 }

@@ -613,7 +613,7 @@ class TerminalSmoke(unittest.TestCase):
         self.assertIn(widget.footer().lstrip()[0], SPINNER_FRAMES)
         self.assertIn("Loading cities", widget.footer())
 
-        widget.wait_for(lambda: "Service running" in widget.footer())
+        widget.wait_for(lambda: widget.footer().strip() == "● Disconnected")
         self.assertFalse(any(frame in widget.footer() for frame in SPINNER_FRAMES))
         self.assertEqual(widget.query(), "new")
         self.assertTrue(widget.footer().endswith("● Disconnected "))
