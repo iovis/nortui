@@ -471,7 +471,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     }
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("• ", Style::default().fg(status_color(app))),
+            Span::styled("⦁ ", Style::default().fg(status_color(app))),
             Span::styled(status, Style::default().fg(GRAY)),
         ])),
         status_area,
@@ -775,7 +775,7 @@ mod tests {
         assert_eq!(buffer[(30, 9)].fg, TEXT);
         assert!(buffer.content().iter().all(|cell| cell.bg == Color::Reset));
         assert!(row_text(&terminal, 10).starts_with('─'));
-        assert!(row_text(&terminal, 11).ends_with("• Connected "));
+        assert!(row_text(&terminal, 11).ends_with("⦁ Connected "));
         assert!(row_text(&terminal, 11)[..66].trim().is_empty());
         assert!(!terminal.backend().cursor_visible());
     }
@@ -915,7 +915,7 @@ mod tests {
         assert!(!text(&terminal).contains('�'));
         assert!(row_text(&terminal, 9).trim_end().ends_with('…'));
         assert!(row_text(&terminal, 10).starts_with('─'));
-        assert!(row_text(&terminal, 11).ends_with("• Connected "));
+        assert!(row_text(&terminal, 11).ends_with("⦁ Connected "));
     }
 
     #[test]
@@ -1167,7 +1167,7 @@ mod tests {
                 let circle_x = 79 - status_width - 2;
                 let terminal = terminal(&mut app, 80, 12);
                 let buffer = terminal.backend().buffer();
-                assert_eq!(buffer[(circle_x, 11)].symbol(), "•");
+                assert_eq!(buffer[(circle_x, 11)].symbol(), "⦁");
                 assert_eq!(buffer[(circle_x, 11)].fg, color);
                 for x in circle_x + 2..79 {
                     assert_eq!(buffer[(x, 11)].fg, GRAY);
@@ -1201,9 +1201,9 @@ mod tests {
             let terminal = terminal(&mut app, width, 12);
             let buffer = terminal.backend().buffer();
             let circle_x = width - 12;
-            assert_eq!(buffer[(circle_x, 11)].symbol(), "•");
+            assert_eq!(buffer[(circle_x, 11)].symbol(), "⦁");
             assert_eq!(buffer[(circle_x, 11)].fg, GREEN);
-            assert!(row_text(&terminal, 11).ends_with("• Connected "));
+            assert!(row_text(&terminal, 11).ends_with("⦁ Connected "));
             assert_eq!(buffer[(width - 1, 11)].symbol(), " ");
             assert_eq!(buffer[(circle_x - 1, 11)].symbol(), " ");
             assert_eq!(buffer[(circle_x - 2, 11)].symbol(), " ");
@@ -1237,7 +1237,7 @@ mod tests {
         let narrow = terminal(&mut app, 32, 12);
         assert!(row_text(&narrow, 11).contains('接'));
         assert!(row_text(&narrow, 11).contains('…'));
-        assert!(row_text(&narrow, 11).ends_with("• Connected "));
+        assert!(row_text(&narrow, 11).ends_with("⦁ Connected "));
     }
 
     #[test]
@@ -1252,9 +1252,9 @@ mod tests {
             app.set_notice("A long operation finished", false);
             let terminal = terminal(&mut app, 24, 5);
             let footer = row_text(&terminal, 4);
-            assert!(footer.ends_with(&format!("• {} ", app.status_text())));
+            assert!(footer.ends_with(&format!("⦁ {} ", app.status_text())));
             let circle_x = (0..24)
-                .find(|x| terminal.backend().buffer()[(*x, 4)].symbol() == "•")
+                .find(|x| terminal.backend().buffer()[(*x, 4)].symbol() == "⦁")
                 .unwrap();
             assert_eq!(terminal.backend().buffer()[(circle_x, 4)].fg, GRAY);
             assert_eq!(terminal.backend().buffer()[(23, 4)].symbol(), " ");
@@ -1278,7 +1278,7 @@ mod tests {
         assert_eq!(error.backend().buffer()[(2, 9)].fg, RED);
         assert!(row_text(&error, 10).starts_with('─'));
         assert!(row_text(&error, 11).contains("Refreshing…"));
-        assert!(row_text(&error, 11).ends_with("• Connected "));
+        assert!(row_text(&error, 11).ends_with("⦁ Connected "));
         let narrow = terminal(&mut app, 24, 5);
         assert_eq!(narrow.backend().buffer()[(2, 2)].fg, RED);
         assert!(row_text(&narrow, 2).trim_end().ends_with('…'));
@@ -1308,7 +1308,7 @@ mod tests {
         app.set_snapshot(intermediate);
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert_eq!(panel_cells(&terminal), initial);
-        assert!(row_text(&terminal, 11).ends_with("• Connecting… "));
+        assert!(row_text(&terminal, 11).ends_with("⦁ Connecting… "));
 
         let mut tokyo = connected();
         let vpn = tokyo.vpn.as_mut().unwrap();
@@ -1357,8 +1357,8 @@ mod tests {
         }
         assert!(SPINNER_FRAMES.contains(&terminal.backend().buffer()[(2, 11)].symbol()));
         assert_eq!(terminal.backend().buffer()[(2, 11)].fg, GRAY);
-        assert!(row_text(&terminal, 11).ends_with("• Checking… "));
-        let circle = row_text(&terminal, 11).find('•').unwrap();
+        assert!(row_text(&terminal, 11).ends_with("⦁ Checking… "));
+        let circle = row_text(&terminal, 11).find('⦁').unwrap();
         let activity = row_text(&terminal, 11)[..circle].trim().to_owned();
         assert!(SPINNER_FRAMES.contains(&activity.as_str()));
 
@@ -1378,7 +1378,7 @@ mod tests {
         });
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(text(&terminal).contains("VPN is off"));
-        assert!(row_text(&terminal, 11).ends_with("• Service stopped "));
+        assert!(row_text(&terminal, 11).ends_with("⦁ Service stopped "));
         assert!(row_text(&terminal, 11).starts_with("  "));
         assert!(!SPINNER_FRAMES.contains(&terminal.backend().buffer()[(2, 11)].symbol()));
     }
@@ -1497,7 +1497,7 @@ mod tests {
         let key_row = row_containing(&terminal, "i or /");
         assert_eq!(terminal.backend().buffer()[(2, key_row)].fg, BLUE);
         assert_eq!(terminal.backend().buffer()[(20, key_row)].fg, TEXT);
-        assert!(row_text(&terminal, 13).ends_with("• Connected "));
+        assert!(row_text(&terminal, 13).ends_with("⦁ Connected "));
         assert!(
             terminal
                 .backend()
@@ -1535,7 +1535,7 @@ mod tests {
         assert_ne!(text(&small), first);
         assert_eq!(app.help_scroll, 10);
         assert!(!small.backend().cursor_visible());
-        assert!(row_text(&small, 7).ends_with("• Connected "));
+        assert!(row_text(&small, 7).ends_with("⦁ Connected "));
 
         app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
         small.draw(|frame| render(frame, &mut app)).unwrap();

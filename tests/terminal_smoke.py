@@ -313,7 +313,7 @@ class TerminalSmoke(unittest.TestCase):
             if index not in dynamic_rows:
                 self.assertEqual(widget.body()[index], row)
         self.assertNotEqual(widget.body(), first_body)
-        self.assertEqual(widget.footer().strip(), "• Connected")
+        self.assertEqual(widget.footer().strip(), "⦁ Connected")
         self.assertFalse(any(frame.encode() in widget.raw[first_raw_end:] for frame in SPINNER_FRAMES))
         starts = [event["time"] for event in widget.status_events() if event["phase"] == "start"]
         self.assertGreaterEqual(starts[1] - starts[0], 0.85)
@@ -337,7 +337,7 @@ class TerminalSmoke(unittest.TestCase):
                 active = None
         self.assertGreaterEqual(events[1]["time"] - events[0]["time"], 1.3)
         self.assertGreaterEqual(events[2]["time"], events[1]["time"])
-        self.assertEqual(widget.footer().strip(), "• Connected")
+        self.assertEqual(widget.footer().strip(), "⦁ Connected")
         self.assertEqual(widget.location_commands(), [])
 
     def test_initial_status_check_uses_only_footer_progress(self):
@@ -345,15 +345,15 @@ class TerminalSmoke(unittest.TestCase):
         widget.wait_for(lambda: widget.screen.alternate_active and bool(widget.commands()))
         self.assertTrue(all(not row.strip() for row in widget.body()))
         self.assertIn(widget.footer().lstrip()[0], SPINNER_FRAMES)
-        self.assertTrue(widget.footer().endswith("• Checking… "))
-        widget.wait_for(lambda: widget.footer().endswith("• Service stopped "))
+        self.assertTrue(widget.footer().endswith("⦁ Checking… "))
+        widget.wait_for(lambda: widget.footer().endswith("⦁ Service stopped "))
         self.assertIn("VPN is off", widget.text())
         self.assertNotIn(b"Checking connection", widget.raw)
         self.assertFalse(any(frame in widget.footer() for frame in SPINNER_FRAMES))
 
     def test_authentication_preparation_does_not_change_panel_or_footer(self):
         widget = self.widget(cached=True, NORTUI_CREDENTIAL_DELAY="0.5", NORTUI_CONNECT_DELAY="0.5")
-        widget.wait_for(lambda: widget.footer().endswith("• Service stopped "))
+        widget.wait_for(lambda: widget.footer().endswith("⦁ Service stopped "))
         body, footer = widget.body(), widget.footer()
         widget.send(b"c")
         widget.wait_for(lambda: ["sudo", "-n", "-v"] in widget.commands())
@@ -369,14 +369,14 @@ class TerminalSmoke(unittest.TestCase):
         widget.wait_for(lambda: (widget.root / "connect.pid").exists() and "Connecting to" in widget.footer())
         self.assertEqual(widget.body(), body)
         self.assertIn(widget.footer().lstrip()[0], SPINNER_FRAMES)
-        widget.wait_for(lambda: widget.footer().endswith("• Connected "))
+        widget.wait_for(lambda: widget.footer().endswith("⦁ Connected "))
         self.assertIn("New York", widget.text())
         self.assertNotIn("VPN is off", widget.text())
 
     def test_service_actions_keep_body_until_final_status_is_known(self):
         widget = self.widget(cached=True, NORTUI_SERVICE_DELAY="0.35", NORTUI_TRANSITIONS="1")
         (widget.root / "credentials").touch()
-        widget.wait_for(lambda: widget.footer().endswith("• Service stopped "))
+        widget.wait_for(lambda: widget.footer().endswith("⦁ Service stopped "))
         (widget.root / "status-delay").write_text("0.4")
         for final_state, activity, completion, headline in [
             ("Disconnected", "Starting service…", "Service started", "Ready to connect"),
@@ -389,7 +389,7 @@ class TerminalSmoke(unittest.TestCase):
             self.assertIn(widget.footer().lstrip()[0], SPINNER_FRAMES)
             widget.wait_for(lambda: completion in widget.footer() and activity not in widget.footer())
             self.assertEqual(widget.body(), body, "Command completion must wait for the resulting status reading")
-            widget.wait_for(lambda: widget.footer().endswith(f"• {final_state} "))
+            widget.wait_for(lambda: widget.footer().endswith(f"⦁ {final_state} "))
             self.assertIn(headline, widget.text())
             self.assertNotEqual(widget.body(), body)
         self.assertEqual(widget.location_commands(), [])
@@ -412,7 +412,7 @@ class TerminalSmoke(unittest.TestCase):
             self.assertEqual(widget.body(), body)
             widget.wait_for(lambda: completion in widget.footer() and activity not in widget.footer())
             self.assertEqual(widget.body(), body, "Completed command must not restore or replace the confirmed body early")
-            widget.wait_for(lambda: widget.footer().endswith(f"• {status} ") and headline in widget.text())
+            widget.wait_for(lambda: widget.footer().endswith(f"⦁ {status} ") and headline in widget.text())
             self.assertNotEqual(widget.body(), body)
             if key == b"d":
                 self.assertNotIn("192.0.2.10", widget.text())
@@ -431,18 +431,18 @@ class TerminalSmoke(unittest.TestCase):
             (widget.root / "service").write_text(service)
             (widget.root / "vpn").write_text(vpn)
             widget.send(b"r")
-            widget.wait_for(lambda: widget.footer().endswith(f"• {status} "))
+            widget.wait_for(lambda: widget.footer().endswith(f"⦁ {status} "))
             self.assertEqual(widget.body(), body)
             self.assertIn(widget.footer().lstrip()[0], SPINNER_FRAMES)
         (widget.root / "status-failure").touch()
         widget.send(b"r")
         widget.wait_for(lambda: "Temporary VPN status failure" in widget.text())
-        self.assertTrue(widget.footer().endswith("• VPN unavailable "))
+        self.assertTrue(widget.footer().endswith("⦁ VPN unavailable "))
         self.assertEqual(widget.body()[:-1], body[:-1], "The error row must not move the confirmed panel")
         (widget.root / "status-failure").unlink()
         (widget.root / "service").write_text("inactive")
         widget.send(b"r")
-        widget.wait_for(lambda: widget.footer().endswith("• Service stopped "))
+        widget.wait_for(lambda: widget.footer().endswith("⦁ Service stopped "))
         self.assertIn("VPN is off", widget.text())
         self.assertNotIn("New York", widget.text())
         self.assertNotIn("192.0.2.10", widget.text())
@@ -450,12 +450,12 @@ class TerminalSmoke(unittest.TestCase):
 
     def test_shortcut_help_is_dismissible_and_does_not_execute_actions_or_load_locations(self):
         widget = self.widget(service="active", cached=True)
-        widget.wait_for(lambda: widget.footer().endswith("• Disconnected "))
+        widget.wait_for(lambda: widget.footer().endswith("⦁ Disconnected "))
         for close in (b"\x1b", b"?"):
             widget.send(b"?")
             widget.wait_for(lambda: "Shortcuts" in widget.text())
             self.assertFalse(widget.screen.cursor_visible)
-            self.assertTrue(widget.footer().endswith("• Disconnected "))
+            self.assertTrue(widget.footer().endswith("⦁ Disconnected "))
             widget.send(b"cdsri/")
             widget.pump(0.15)
             self.assertIn("Shortcuts", widget.text())
@@ -481,14 +481,14 @@ class TerminalSmoke(unittest.TestCase):
 
     def test_shortcut_help_scrolls_in_small_widget_and_returns_to_panel(self):
         widget = self.widget(width=40, height=9)
-        widget.wait_for(lambda: widget.footer().endswith("• Service stopped "))
+        widget.wait_for(lambda: widget.footer().endswith("⦁ Service stopped "))
         widget.send(b"?")
         widget.wait_for(lambda: "Shortcuts" in widget.text())
         initial = widget.text().splitlines()[:-2]
         widget.send(b"\x1b[F")
         widget.wait_for(lambda: widget.text().splitlines()[:-2] != initial)
         self.assertFalse(widget.screen.cursor_visible)
-        self.assertTrue(widget.footer().endswith("• Service stopped "))
+        self.assertTrue(widget.footer().endswith("⦁ Service stopped "))
         end = widget.text().splitlines()[:-2]
         widget.send(b"\x0b")
         widget.wait_for(lambda: widget.text().splitlines()[:-2] != end)
@@ -500,7 +500,7 @@ class TerminalSmoke(unittest.TestCase):
 
     def test_query_start_end_keys_move_actual_cursor_and_insert_or_paste_there(self):
         widget = self.widget(cached=True)
-        widget.wait_for(lambda: widget.footer().endswith("• Service stopped "))
+        widget.wait_for(lambda: widget.footer().endswith("⦁ Service stopped "))
         widget.send(b"/york")
         widget.wait_for(lambda: widget.query() == "york" and widget.screen.x == 8)
         prompt_row = widget.screen.y
@@ -525,7 +525,7 @@ class TerminalSmoke(unittest.TestCase):
 
     def test_long_query_viewport_follows_start_end_and_wide_character_insertions(self):
         widget = self.widget(cached=True, width=24, height=8)
-        widget.wait_for(lambda: widget.footer().endswith("• Service stopped "))
+        widget.wait_for(lambda: widget.footer().endswith("⦁ Service stopped "))
         widget.send(b"i\x1b[200~start" + b"x" * 60 + b"end\x1b[201~")
         widget.wait_for(lambda: widget.query() is not None and widget.query().endswith("end"))
         self.assertLess(widget.screen.x, 22)
@@ -542,7 +542,7 @@ class TerminalSmoke(unittest.TestCase):
         widget.wait_for(lambda: widget.query().endswith("en"))
         widget.send(b"\x01")
         widget.wait_for(lambda: widget.query().startswith("東") and widget.screen.x == 4)
-        self.assertTrue(widget.footer().endswith("• Service stopped "))
+        self.assertTrue(widget.footer().endswith("⦁ Service stopped "))
         self.assertEqual(widget.location_commands(), [])
 
     def test_stopped_launch_search_and_escape_restore_terminal(self):
@@ -671,7 +671,7 @@ class TerminalSmoke(unittest.TestCase):
         first = widget.footer().lstrip()[0]
         self.assertIn(first, SPINNER_FRAMES)
         self.assertIn("/3 countries", widget.footer())
-        self.assertTrue(widget.footer().endswith("• Disconnected "))
+        self.assertTrue(widget.footer().endswith("⦁ Disconnected "))
 
         widget.send(b"new")
         widget.wait_for(lambda: widget.query() == "new")
@@ -679,10 +679,10 @@ class TerminalSmoke(unittest.TestCase):
         self.assertIn(widget.footer().lstrip()[0], SPINNER_FRAMES)
         self.assertIn("Loading cities", widget.footer())
 
-        widget.wait_for(lambda: widget.footer().strip() == "• Disconnected")
+        widget.wait_for(lambda: widget.footer().strip() == "⦁ Disconnected")
         self.assertFalse(any(frame in widget.footer() for frame in SPINNER_FRAMES))
         self.assertEqual(widget.query(), "new")
-        self.assertTrue(widget.footer().endswith("• Disconnected "))
+        self.assertTrue(widget.footer().endswith("⦁ Disconnected "))
 
     def test_panel_launch_service_start_and_refresh_defer_locations_until_search(self):
         for service, trigger in (("active", b"i"), ("inactive", b"/")):
@@ -690,9 +690,9 @@ class TerminalSmoke(unittest.TestCase):
                 widget = self.widget(service=service, cached=True, NORTUI_CITY_DELAY="1")
                 (widget.root / "credentials").touch()
                 if service == "inactive":
-                    widget.wait_for(lambda: widget.footer().endswith("• Service stopped "))
+                    widget.wait_for(lambda: widget.footer().endswith("⦁ Service stopped "))
                     widget.send(b"s")
-                widget.wait_for(lambda: widget.footer().endswith("• Disconnected "))
+                widget.wait_for(lambda: widget.footer().endswith("⦁ Disconnected "))
                 widget.pump(0.15)
                 self.assertEqual(widget.location_commands(), [])
                 widget.send(b"r")
@@ -717,7 +717,7 @@ class TerminalSmoke(unittest.TestCase):
     def test_completed_search_catalog_survives_reopening_restart_and_refresh(self):
         widget = self.widget(service="active")
         (widget.root / "credentials").touch()
-        widget.wait_for(lambda: widget.footer().endswith("• Disconnected "))
+        widget.wait_for(lambda: widget.footer().endswith("⦁ Disconnected "))
         widget.send(b"i")
         cache = widget.root / "cache/nortui/locations.json"
         widget.wait_for(lambda: cache.exists() and "Tokyo" in cache.read_text() and "Loading" not in widget.footer())
@@ -733,9 +733,9 @@ class TerminalSmoke(unittest.TestCase):
         widget.send(b"\x1b")
         widget.wait_for(lambda: "Ready to connect" in widget.text())
         widget.send(b"s")
-        widget.wait_for(lambda: widget.footer().endswith("• Service stopped "))
+        widget.wait_for(lambda: widget.footer().endswith("⦁ Service stopped "))
         widget.send(b"s")
-        widget.wait_for(lambda: widget.footer().endswith("• Disconnected "))
+        widget.wait_for(lambda: widget.footer().endswith("⦁ Disconnected "))
         widget.pump(0.15)
         self.assertEqual(widget.location_commands(), first)
         widget.send(b"i")
@@ -761,7 +761,7 @@ class TerminalSmoke(unittest.TestCase):
             with self.subTest(stop_source=stop_source):
                 widget = self.widget(service="active", cached=True, NORTUI_CITY_DELAY=delay)
                 (widget.root / "credentials").touch()
-                widget.wait_for(lambda: widget.footer().endswith("• Disconnected "))
+                widget.wait_for(lambda: widget.footer().endswith("⦁ Disconnected "))
                 widget.send(b"/new")
                 workers = [widget.root / f"city-{country}.pid" for country in ("United_States", "Japan")]
                 widget.wait_for(lambda: all(path.exists() for path in workers) and len(widget.location_commands()) == 4 and "Loading cities" in widget.footer())
@@ -773,11 +773,11 @@ class TerminalSmoke(unittest.TestCase):
                     widget.send(b"s")
                 else:
                     (widget.root / "service").write_text("inactive")
-                widget.wait_for(lambda: widget.footer().endswith("• Service stopped "))
+                widget.wait_for(lambda: widget.footer().endswith("⦁ Service stopped "))
                 widget.wait_for(lambda: all(not Path(f"/proc/{pid}").exists() for pid in pids))
                 before = widget.location_commands()
                 widget.send(b"s")
-                widget.wait_for(lambda: widget.footer().endswith("• Disconnected "))
+                widget.wait_for(lambda: widget.footer().endswith("⦁ Disconnected "))
                 widget.pump(0.15)
                 self.assertEqual(widget.location_commands(), before)
                 self.assertNotIn("Loading", widget.footer())
@@ -900,11 +900,11 @@ class TerminalSmoke(unittest.TestCase):
         self.assertIn("192.0.2.10", widget.text())
         self.assertIn("NORDLYNX", widget.text())
         self.assertNotIn("Location", widget.text())
-        self.assertTrue(widget.footer().endswith("• Connected "))
+        self.assertTrue(widget.footer().endswith("⦁ Connected "))
         self.assertNotIn("United States", widget.footer())
         widget.send(b"/")
         widget.wait_for(lambda: widget.query() == "Search countries and cities…")
-        self.assertTrue(widget.footer().endswith("• Connected "))
+        self.assertTrue(widget.footer().endswith("⦁ Connected "))
         self.assertNotIn("192.0.2.10", widget.text())
         widget.send(b"\x1b")
         widget.wait_for(lambda: "Technology" in widget.text())
@@ -917,8 +917,8 @@ class TerminalSmoke(unittest.TestCase):
         widget.wait_for(lambda: (widget.root / "connect.pid").exists())
         pid = int((widget.root / "connect.pid").read_text())
         widget.wait_for(lambda: "…" in widget.footer())
-        self.assertTrue(widget.footer().endswith("• Disconnected "))
-        self.assertEqual(widget.footer().count("•"), 1)
+        self.assertTrue(widget.footer().endswith("⦁ Disconnected "))
+        self.assertEqual(widget.footer().count("⦁"), 1)
         widget.send(b"\x03")
         self.assertEqual(widget.process.wait(timeout=3), 0)
         self.assertFalse(Path(f"/proc/{pid}").exists())
