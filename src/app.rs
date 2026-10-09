@@ -36,6 +36,7 @@ pub enum Mode {
     #[default]
     Panel,
     Search,
+    Help,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -70,6 +71,7 @@ pub struct Notice {
 pub struct App {
     pub mode: Mode,
     pub query: String,
+    pub help_scroll: u16,
     pub snapshot: Snapshot,
     pub locations: Vec<Location>,
     pub results: Vec<SearchResult>,
@@ -78,6 +80,7 @@ pub struct App {
     pub notice: Option<Notice>,
     pub busy: Option<Action>,
     pub loading: Option<(usize, usize)>,
+    query_cursor: usize,
     matcher: Matcher,
 }
 
@@ -86,6 +89,7 @@ impl App {
         let mut app = Self {
             mode: Mode::Panel,
             query: String::new(),
+            help_scroll: 0,
             snapshot: Snapshot::default(),
             locations,
             results: Vec::new(),
@@ -94,6 +98,7 @@ impl App {
             notice: None,
             busy: None,
             loading: None,
+            query_cursor: 0,
             matcher: Matcher::new(Config::DEFAULT),
         };
         app.rebuild(false);
@@ -157,8 +162,25 @@ impl App {
                     self.move_selection(-1);
                     Input::None
                 }
+                KeyCode::Char('j') if self.mode == Mode::Help => {
+                    self.help_scroll = self.help_scroll.saturating_add(1);
+                    Input::None
+                }
+                KeyCode::Char('k') if self.mode == Mode::Help => {
+                    self.help_scroll = self.help_scroll.saturating_sub(1);
+                    Input::None
+                }
+                KeyCode::Char('a') if self.mode == Mode::Search => {
+                    self.query_cursor = 0;
+                    Input::None
+                }
+                KeyCode::Char('e') if self.mode == Mode::Search => {
+                    self.query_cursor = self.query.len();
+                    Input::None
+                }
                 KeyCode::Char('u') if self.mode == Mode::Search => {
                     self.query.clear();
+                    self.query_cursor = 0;
                     self.rebuild(false);
                     Input::None
                 }
@@ -169,25 +191,57 @@ impl App {
             Mode::Panel if key.kind == KeyEventKind::Press => self.handle_panel_key(key.code),
             Mode::Panel => Input::None,
             Mode::Search => self.handle_search_key(key),
+            Mode::Help => self.handle_help_key(key),
         }
     }
 
     pub fn open_search(&mut self) {
         self.mode = Mode::Search;
         self.query.clear();
+        self.query_cursor = 0;
+        self.help_scroll = 0;
         self.rebuild(false);
     }
 
     fn show_panel(&mut self) {
         self.mode = Mode::Panel;
         self.query.clear();
+        self.query_cursor = 0;
+        self.help_scroll = 0;
         self.rebuild(false);
+    }
+
+    fn handle_help_key(&mut self, key: KeyEvent) -> Input {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('?') if key.kind == KeyEventKind::Press => {
+                self.show_panel();
+            }
+            KeyCode::Char('q') if key.kind == KeyEventKind::Press => return Input::Exit,
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.help_scroll = self.help_scroll.saturating_add(1);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.help_scroll = self.help_scroll.saturating_sub(1);
+            }
+            KeyCode::PageDown => self.help_scroll = self.help_scroll.saturating_add(10),
+            KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(10),
+            KeyCode::Home => self.help_scroll = 0,
+            KeyCode::End => self.help_scroll = u16::MAX,
+            _ => {}
+        }
+        Input::None
     }
 
     fn handle_panel_key(&mut self, code: KeyCode) -> Input {
         match code {
             KeyCode::Char('i' | '/') => {
                 self.open_search();
+                Input::None
+            }
+            KeyCode::Char('?') => {
+                self.mode = Mode::Help;
+                self.help_scroll = 0;
+                self.rebuild(false);
                 Input::None
             }
             KeyCode::Char('c') => Input::Execute(
@@ -246,6 +300,22 @@ impl App {
                 self.move_selection(-10);
                 Input::None
             }
+            KeyCode::Left => {
+                self.query_cursor = self.previous_query_boundary();
+                Input::None
+            }
+            KeyCode::Right => {
+                self.query_cursor = self.next_query_boundary();
+                Input::None
+            }
+            KeyCode::Home => {
+                self.query_cursor = 0;
+                Input::None
+            }
+            KeyCode::End => {
+                self.query_cursor = self.query.len();
+                Input::None
+            }
             KeyCode::Enter if key.kind == KeyEventKind::Press && self.busy.is_none() => {
                 let action = self
                     .results
@@ -259,15 +329,17 @@ impl App {
                 }
             }
             KeyCode::Backspace => {
-                if let Some((index, _)) = self.query.grapheme_indices(true).next_back() {
-                    self.query.truncate(index);
+                let cursor = self.query_cursor();
+                let previous = self.previous_query_boundary();
+                if previous != cursor {
+                    self.query.replace_range(previous..cursor, "");
+                    self.query_cursor = previous;
+                    self.rebuild(false);
                 }
-                self.rebuild(false);
                 Input::None
             }
             KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::ALT) => {
-                self.query.push(character);
-                self.rebuild(false);
+                self.insert_query(character.encode_utf8(&mut [0; 4]));
                 Input::None
             }
             _ => Input::None,
@@ -278,8 +350,58 @@ impl App {
         if self.mode != Mode::Search {
             return;
         }
+        let value: String = value
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect();
+        self.insert_query(&value);
+    }
+
+    pub fn query_cursor(&self) -> usize {
         self.query
-            .extend(value.chars().filter(|character| !character.is_control()));
+            .grapheme_indices(true)
+            .map(|(index, _)| index)
+            .chain(std::iter::once(self.query.len()))
+            .take_while(|index| *index <= self.query_cursor)
+            .last()
+            .unwrap_or(0)
+    }
+
+    fn previous_query_boundary(&self) -> usize {
+        let cursor = self.query_cursor();
+        self.query
+            .grapheme_indices(true)
+            .map(|(index, _)| index)
+            .take_while(|index| *index < cursor)
+            .last()
+            .unwrap_or(0)
+    }
+
+    fn next_query_boundary(&self) -> usize {
+        let cursor = self.query_cursor();
+        self.query
+            .grapheme_indices(true)
+            .map(|(index, _)| index)
+            .find(|index| *index > cursor)
+            .unwrap_or(self.query.len())
+    }
+
+    fn insert_query(&mut self, value: &str) {
+        if value.is_empty() {
+            return;
+        }
+        let cursor = self.query_cursor();
+        self.query.insert_str(cursor, value);
+        let inserted_end = cursor + value.len();
+        // Inserting a combining mark or joiner can merge with the following
+        // grapheme. Keep the cursor after the whole newly formed cluster.
+        self.query_cursor = self
+            .query
+            .grapheme_indices(true)
+            .map(|(index, _)| index)
+            .chain(std::iter::once(self.query.len()))
+            .find(|index| *index >= inserted_end)
+            .unwrap_or(self.query.len());
         self.rebuild(false);
     }
 
@@ -314,7 +436,7 @@ impl App {
     }
 
     fn candidates(&self) -> Vec<SearchResult> {
-        if self.mode == Mode::Panel {
+        if self.mode != Mode::Search {
             return Vec::new();
         }
         let mut locations: Vec<_> = self
@@ -1193,6 +1315,114 @@ mod tests {
         app.open_search();
         app.paste("e\u{301}\n\u{1b}");
         assert_eq!(app.query, "e\u{301}");
+        app.handle_key(key(KeyCode::Backspace));
+        assert!(app.query.is_empty());
+    }
+
+    #[test]
+    fn shortcut_help_is_modal_and_question_mark_stays_search_text() {
+        let mut app = App::new(vec![Location {
+            country: "Japan".into(),
+            city: Some("Tokyo".into()),
+        }]);
+        assert_eq!(app.handle_key(key(KeyCode::Char('?'))), Input::None);
+        assert_eq!(app.mode, Mode::Help);
+        assert!(app.results.is_empty());
+        for character in "cdsri/".chars() {
+            assert_eq!(app.handle_key(key(KeyCode::Char(character))), Input::None);
+            assert_eq!(app.mode, Mode::Help);
+        }
+        app.paste("ignored");
+        assert!(app.query.is_empty());
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            Input::Execute(Action::Refresh)
+        );
+        assert_eq!(app.handle_key(key(KeyCode::Char('q'))), Input::Exit);
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Input::Exit
+        );
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Panel);
+        app.handle_key(key(KeyCode::Char('?')));
+        app.handle_key(key(KeyCode::Char('?')));
+        assert_eq!(app.mode, Mode::Panel);
+        app.open_search();
+        assert_eq!(app.handle_key(key(KeyCode::Char('?'))), Input::None);
+        assert_eq!(app.mode, Mode::Search);
+        assert_eq!(app.query, "?");
+    }
+
+    #[test]
+    fn query_start_end_movement_preserves_results_and_edits_at_cursor() {
+        let mut app = App::new(vec![Location {
+            country: "Japan".into(),
+            city: Some("Tokyo".into()),
+        }]);
+        app.open_search();
+        app.paste("Tokyo");
+        let action = app.results[0].action.clone();
+        for (character, position) in [('a', 0), ('e', "Tokyo".len())] {
+            app.handle_key(KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::CONTROL,
+            ));
+            assert_eq!(app.query, "Tokyo");
+            assert_eq!(app.query_cursor(), position);
+            assert_eq!(app.results[app.selected].action, action);
+        }
+        app.handle_key(key(KeyCode::Home));
+        app.paste("e\u{301}");
+        assert_eq!(app.query, "e\u{301}Tokyo");
+        assert_eq!(app.query_cursor(), "e\u{301}".len());
+        app.handle_key(key(KeyCode::Backspace));
+        assert_eq!(app.query, "Tokyo");
+        assert_eq!(app.query_cursor(), 0);
+        app.handle_key(key(KeyCode::Right));
+        app.handle_key(key(KeyCode::Backspace));
+        assert_eq!(app.query, "okyo");
+        assert_eq!(app.query_cursor(), 0);
+        app.handle_key(key(KeyCode::Char('T')));
+        assert_eq!(app.query, "Tokyo");
+        app.handle_key(key(KeyCode::End));
+        app.handle_key(key(KeyCode::Left));
+        app.handle_key(key(KeyCode::Backspace));
+        assert_eq!(app.query, "Toko");
+        assert_eq!(app.query_cursor(), "Tok".len());
+        app.paste("y\n\u{1b}");
+        assert_eq!(app.query, "Tokyo");
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(app.query.is_empty());
+        assert_eq!(app.query_cursor(), 0);
+        app.handle_key(key(KeyCode::Left));
+        app.handle_key(key(KeyCode::Right));
+        app.handle_key(key(KeyCode::Backspace));
+        assert!(app.query.is_empty());
+    }
+
+    #[test]
+    fn cursor_stays_on_grapheme_boundary_when_insertion_joins_following_text() {
+        let mut app = App::new(Vec::new());
+        app.open_search();
+        app.paste("👩💻");
+        app.handle_key(key(KeyCode::Home));
+        app.handle_key(key(KeyCode::Right));
+        app.paste("\u{200d}");
+        assert_eq!(app.query, "👩‍💻");
+        assert_eq!(app.query_cursor(), app.query.len());
+        app.handle_key(key(KeyCode::Backspace));
+        assert!(app.query.is_empty());
+
+        app.paste("東京");
+        app.handle_key(key(KeyCode::Left));
+        app.handle_key(key(KeyCode::Backspace));
+        assert_eq!(app.query, "京");
+        assert_eq!(app.query_cursor(), 0);
+        app.query.clear();
+        app.paste("東京");
+        app.query = "e\u{301}".into();
+        assert_eq!(app.query_cursor(), app.query.len());
         app.handle_key(key(KeyCode::Backspace));
         assert!(app.query.is_empty());
     }

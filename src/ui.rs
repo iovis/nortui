@@ -39,6 +39,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     match app.mode {
         Mode::Panel => render_panel(frame, app, body),
         Mode::Search => render_search(frame, app, body),
+        Mode::Help => render_help(frame, app, body),
     }
     if let Some(notice) = app.notice.as_ref().filter(|notice| notice.is_error) {
         let error = Rect::new(body.x, separator.y - 1, body.width, 1);
@@ -254,6 +255,90 @@ fn metadata_line(label: &str, value: &str, width: u16) -> Line<'static> {
     ])
 }
 
+fn render_help(frame: &mut Frame, app: &mut App, area: Rect) {
+    let lines = help_lines(area.width);
+    let maximum_scroll = lines.len().saturating_sub(usize::from(area.height));
+    app.help_scroll = app
+        .help_scroll
+        .min(u16::try_from(maximum_scroll).unwrap_or(u16::MAX));
+    frame.render_widget(Paragraph::new(lines).scroll((app.help_scroll, 0)), area);
+}
+
+fn help_lines(width: u16) -> Vec<Line<'static>> {
+    let mut lines = vec![headline_line("Shortcuts", width)];
+    lines.extend(help_entry("? / Esc", "Back to panel", width));
+    lines.extend(help_entry("↑↓ / j/k", "Scroll help", width));
+    lines.push(Line::default());
+    for (section, entries) in [
+        (
+            "Panel",
+            vec![
+                ("i or /", "Search countries and cities"),
+                ("c", "Connect or reconnect"),
+                ("d", "Disconnect"),
+                ("s", "Start or stop service"),
+                ("r / Ctrl-R", "Refresh status; locations on next search"),
+                ("q / Esc / Ctrl-C", "Quit"),
+                ("?", "Open shortcut help"),
+            ],
+        ),
+        (
+            "Location search",
+            vec![
+                ("↑↓ / Ctrl-J/K", "Select a result"),
+                ("Ctrl-N/P", "Select a result"),
+                ("PgUp / PgDn", "Move ten results"),
+                ("Ctrl-A / Home", "Query start"),
+                ("Ctrl-E / End", "Query end"),
+                ("← / →", "Move query cursor"),
+                ("Backspace", "Delete before cursor"),
+                ("Ctrl-U", "Clear query"),
+                ("Enter", "Connect and return to panel"),
+                ("Esc", "Return to panel"),
+                ("Ctrl-R", "Refresh status and locations"),
+                ("Ctrl-C", "Quit"),
+            ],
+        ),
+        (
+            "Help navigation",
+            vec![
+                ("↑↓ / j/k", "Scroll help"),
+                ("Ctrl-J/K", "Scroll help"),
+                ("PgUp / PgDn", "Scroll ten rows"),
+                ("Home / End", "First or last page"),
+            ],
+        ),
+    ] {
+        lines.push(Line::styled(
+            section,
+            Style::default().fg(GRAY).add_modifier(Modifier::BOLD),
+        ));
+        for (keys, description) in entries {
+            lines.extend(help_entry(keys, description, width));
+        }
+        lines.push(Line::default());
+    }
+    lines.pop();
+    lines
+}
+
+fn help_entry(keys: &str, description: &str, width: u16) -> Vec<Line<'static>> {
+    let keys_width = if width >= 44 { 18 } else { 2 };
+    let mut lines = wrapped_lines(description, width.saturating_sub(keys_width), TEXT);
+    for (index, line) in lines.iter_mut().enumerate() {
+        let prefix = if index == 0 && keys_width == 18 {
+            Span::styled(format!("{keys:<18}"), Style::default().fg(BLUE))
+        } else {
+            Span::raw(" ".repeat(usize::from(keys_width)))
+        };
+        line.spans.insert(0, prefix);
+    }
+    if keys_width == 2 {
+        lines.insert(0, Line::styled(keys.to_owned(), Style::default().fg(BLUE)));
+    }
+    lines
+}
+
 fn render_search(frame: &mut Frame, app: &mut App, area: Rect) {
     let search_height = area.height.min(2);
     let search = Rect::new(area.x, area.y, area.width, search_height);
@@ -263,7 +348,11 @@ fn render_search(frame: &mut Frame, app: &mut App, area: Rect) {
         area.width,
         area.height - search_height,
     );
-    let query = visible_query(&app.query, search.width.saturating_sub(3));
+    let (query, cursor_column) = query_viewport(
+        &app.query,
+        app.query_cursor(),
+        search.width.saturating_sub(3),
+    );
     let search_text = Line::from(vec![
         Span::styled("› ", Style::default().fg(BLUE)),
         if app.query.is_empty() {
@@ -275,7 +364,7 @@ fn render_search(frame: &mut Frame, app: &mut App, area: Rect) {
                 Style::default().fg(GRAY),
             )
         } else {
-            Span::styled(query.clone(), Style::default().fg(TEXT))
+            Span::styled(query, Style::default().fg(TEXT))
         },
     ]);
     frame.render_widget(
@@ -286,10 +375,7 @@ fn render_search(frame: &mut Frame, app: &mut App, area: Rect) {
         ),
         search,
     );
-    frame.set_cursor_position((
-        search.x + 2 + u16::try_from(Line::from(query).width()).unwrap_or(0),
-        search.y,
-    ));
+    frame.set_cursor_position((search.x + 2 + cursor_column, search.y));
     if app.results.is_empty() {
         let message = if app.query.trim().is_empty() {
             "No cached locations"
@@ -410,18 +496,37 @@ fn truncate(text: &str, width: u16) -> String {
     clipped
 }
 
-fn visible_query(query: &str, width: u16) -> String {
+fn query_viewport(query: &str, cursor: usize, width: u16) -> (String, u16) {
+    if Line::from(query).width() <= usize::from(width) {
+        let cursor_column = u16::try_from(Line::from(&query[..cursor]).width()).unwrap_or(0);
+        return (query.to_owned(), cursor_column);
+    }
+    let before_cursor = if cursor == query.len() {
+        width
+    } else {
+        width / 2
+    };
     let mut size = 0;
-    let mut start = query.len();
-    for (index, grapheme) in query.grapheme_indices(true).rev() {
+    let mut start = cursor;
+    for (index, grapheme) in query[..cursor].grapheme_indices(true).rev() {
         let next_size = size + Line::from(grapheme).width();
-        if next_size > usize::from(width) {
+        if next_size > usize::from(before_cursor) {
             break;
         }
         start = index;
         size = next_size;
     }
-    query[start..].to_owned()
+    let cursor_column = u16::try_from(size).unwrap_or(0);
+    let mut end = start;
+    size = 0;
+    for (index, grapheme) in query[start..].grapheme_indices(true) {
+        size += Line::from(grapheme).width();
+        if size > usize::from(width) {
+            break;
+        }
+        end = start + index + grapheme.len();
+    }
+    (query[start..end].to_owned(), cursor_column)
 }
 
 fn list_item(row: &SearchResult, width: u16) -> ListItem<'static> {
@@ -466,6 +571,7 @@ mod tests {
     use super::*;
     use crate::app::ItemKind;
     use crate::model::{Location, Snapshot, VpnStatus};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -477,8 +583,17 @@ mod tests {
 
     fn row_text(terminal: &Terminal<TestBackend>, row: u16) -> String {
         let buffer = terminal.backend().buffer();
+        let mut continuation_cells = 0;
         (0..buffer.area.width)
-            .map(|x| buffer[(x, row)].symbol())
+            .filter_map(|x| {
+                if continuation_cells > 0 {
+                    continuation_cells -= 1;
+                    return None;
+                }
+                let symbol = buffer[(x, row)].symbol();
+                continuation_cells = Line::from(symbol).width().saturating_sub(1);
+                Some(symbol)
+            })
             .collect()
     }
 
@@ -735,8 +850,8 @@ mod tests {
     }
 
     #[test]
-    fn both_modes_share_compact_footer_with_gray_status_right_pad_and_state_color() {
-        for mode in [Mode::Panel, Mode::Search] {
+    fn all_views_share_compact_footer_with_gray_status_right_pad_and_state_color() {
+        for mode in [Mode::Panel, Mode::Search, Mode::Help] {
             for (service, state, color) in [
                 (ServiceState::Active, Some(VpnState::Connected), GREEN),
                 (ServiceState::Active, Some(VpnState::Disconnected), RED),
@@ -922,6 +1037,141 @@ mod tests {
                 .content()
                 .iter()
                 .all(|cell| cell.bg == Color::Reset)
+        );
+    }
+
+    #[test]
+    fn shortcut_help_preserves_footer_styles_and_clears_when_dismissed() {
+        let mut app = App::new(vec![country()]);
+        app.set_snapshot(connected());
+        let mut terminal = terminal(&mut app, 80, 14);
+        assert!(text(&terminal).contains("New York"));
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.mode, Mode::Help);
+        assert!(text(&terminal).contains("Shortcuts"));
+        assert!(text(&terminal).contains("? / Esc"));
+        assert!(text(&terminal).contains("Back to panel"));
+        assert!(text(&terminal).contains("Scroll help"));
+        assert!(!text(&terminal).contains("New York"));
+        assert!(!text(&terminal).contains("VPN IP"));
+        assert!(!terminal.backend().cursor_visible());
+        let key_row = row_containing(&terminal, "i or /");
+        assert_eq!(terminal.backend().buffer()[(2, key_row)].fg, BLUE);
+        assert_eq!(terminal.backend().buffer()[(20, key_row)].fg, TEXT);
+        assert!(row_text(&terminal, 13).ends_with("● Connected "));
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .all(|cell| cell.bg == Color::Reset)
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.mode, Mode::Panel);
+        assert!(text(&terminal).contains("New York"));
+        assert!(!text(&terminal).contains("Shortcuts"));
+        assert!(!terminal.backend().cursor_visible());
+
+        app.open_search();
+        app.paste("?");
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(row_text(&terminal, 1).starts_with("  › ?"));
+        assert!(!text(&terminal).contains("Shortcuts"));
+        assert!(terminal.backend().cursor_visible());
+    }
+
+    #[test]
+    fn help_scrolls_wrapped_content_and_clamps_after_a_wider_taller_resize() {
+        let mut app = App::new(Vec::new());
+        app.set_snapshot(connected());
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        let mut small = terminal(&mut app, 24, 8);
+        assert!(text(&small).contains("Shortcuts"));
+        let first = text(&small);
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        small.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_ne!(text(&small), first);
+        assert_eq!(app.help_scroll, 10);
+        assert!(!small.backend().cursor_visible());
+        assert!(row_text(&small, 7).ends_with("● Connected "));
+
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        small.draw(|frame| render(frame, &mut app)).unwrap();
+        let small_maximum = help_lines(20).len() - 5;
+        assert_eq!(usize::from(app.help_scroll), small_maximum);
+        assert!(text(&small).contains("Home / End"));
+        assert!(text(&small).contains("First or last page"));
+
+        let larger = terminal(&mut app, 80, 24);
+        let larger_maximum = help_lines(76).len().saturating_sub(21);
+        assert_eq!(usize::from(app.help_scroll), larger_maximum);
+        assert!(text(&larger).contains("Home / End"));
+        assert!(!larger.backend().cursor_visible());
+        app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        let full = terminal(&mut app, 80, 50);
+        assert_eq!(app.help_scroll, 0);
+        for key in [
+            "Ctrl-A / Home",
+            "Ctrl-E / End",
+            "Ctrl-J/K",
+            "Ctrl-N/P",
+            "Ctrl-U",
+            "Ctrl-R",
+            "Ctrl-C",
+        ] {
+            assert!(text(&full).contains(key));
+        }
+    }
+
+    #[test]
+    fn narrow_unicode_query_viewport_follows_beginning_end_and_grapheme_cursor() {
+        let mut app = App::new(vec![country()]);
+        app.open_search();
+        let original = "e\u{301}東京01234567890123456789🏳️‍🌈終";
+        app.paste(original);
+        let mut terminal = terminal(&mut app, 24, 8);
+        let end_view = row_text(&terminal, 1);
+        terminal.backend_mut().assert_cursor_position((21, 1));
+        assert!(!end_view.contains("e\u{301}"));
+        assert!(end_view.contains("7890123456789🏳️‍🌈"));
+        assert!(end_view.contains('終'));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        terminal.backend_mut().assert_cursor_position((4, 1));
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(4, 1)].symbol(), "e\u{301}");
+        assert_eq!(buffer[(5, 1)].symbol(), "東");
+        assert_eq!(buffer[(7, 1)].symbol(), "京");
+        assert!(!row_text(&terminal, 1).contains('終'));
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        terminal.backend_mut().assert_cursor_position((5, 1));
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        terminal.backend_mut().assert_cursor_position((7, 1));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        terminal.backend_mut().assert_cursor_position((21, 1));
+        assert_eq!(row_text(&terminal, 1), end_view);
+        assert_eq!(app.query, original);
+        assert_eq!(
+            query_viewport("United States", 10, 17),
+            ("United States".into(), 10)
+        );
+        assert_eq!(
+            query_viewport("e\u{301}東京🏳️‍🌈", 0, 5),
+            ("e\u{301}東京".into(), 0)
+        );
+        assert_eq!(
+            query_viewport("e\u{301}東京🏳️‍🌈", "e\u{301}東京🏳️‍🌈".len(), 5),
+            ("京🏳️‍🌈".into(), 4)
         );
     }
 
