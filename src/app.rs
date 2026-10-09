@@ -570,11 +570,13 @@ pub enum Input {
 
 enum Event {
     Status(std::result::Result<Snapshot, String>),
-    Prepared {
-        action: Action,
-        authenticate: bool,
-    },
+    Prepared { action: Action, authenticate: bool },
     Finished(std::result::Result<String, String>),
+    Discovery { run: u64, event: DiscoveryEvent },
+    Exit,
+}
+
+enum DiscoveryEvent {
     Countries(Vec<String>),
     Cities {
         country: String,
@@ -582,8 +584,7 @@ enum Event {
         finished: usize,
         total: usize,
     },
-    DiscoveryDone(Option<String>),
-    Exit,
+    Done(Option<String>),
 }
 
 struct Message {
@@ -603,6 +604,7 @@ struct Controller {
     status_job: Option<JoinHandle<()>>,
     action_job: Option<JoinHandle<()>>,
     discovery_job: Option<JoinHandle<()>>,
+    discovery_generation: u64,
     discovery_requested: bool,
     last_poll: Instant,
     status_error: Option<String>,
@@ -639,6 +641,7 @@ impl Controller {
             status_job: None,
             action_job: None,
             discovery_job: None,
+            discovery_generation: 0,
             discovery_requested: true,
             last_poll: Instant::now(),
             status_error: None,
@@ -693,11 +696,13 @@ impl Controller {
             && self.discovery_job.is_none()
         {
             self.discovery_requested = false;
+            self.discovery_generation += 1;
             self.app.loading = Some((0, 0));
             self.discovery_job = Some(self.handle.spawn(discover(
                 self.backend.clone(),
                 self.sender.clone(),
                 self.generation,
+                self.discovery_generation,
             )));
         }
     }
@@ -708,9 +713,8 @@ impl Controller {
         }
         self.generation += 1;
         abort(&mut self.status_job);
-        self.discovery_requested |= self.discovery_job.is_some() || action == Action::Refresh;
-        abort(&mut self.discovery_job);
-        self.app.loading = None;
+        self.cancel_discovery();
+        self.discovery_requested |= action == Action::Refresh;
         if action == Action::Refresh {
             self.app.set_notice(REFRESH_NOTICE, false);
             self.spawn_status();
@@ -819,12 +823,30 @@ impl Controller {
                 }
             }
             Event::Finished(result) => self.finish_action(result),
-            Event::Countries(countries) => {
+            Event::Discovery { run, event } => self.apply_discovery(run, event),
+            Event::Exit => {}
+        }
+        Ok(())
+    }
+
+    fn cancel_discovery(&mut self) {
+        self.discovery_requested |= self.discovery_job.is_some();
+        self.discovery_generation += 1;
+        abort(&mut self.discovery_job);
+        self.app.loading = None;
+    }
+
+    fn apply_discovery(&mut self, run: u64, event: DiscoveryEvent) {
+        if run != self.discovery_generation || self.discovery_job.is_none() {
+            return;
+        }
+        match event {
+            DiscoveryEvent::Countries(countries) => {
                 self.app.loading = Some((0, countries.len()));
                 self.catalog.set_countries(&countries);
                 self.update_catalog();
             }
-            Event::Cities {
+            DiscoveryEvent::Cities {
                 country,
                 result,
                 finished,
@@ -836,16 +858,14 @@ impl Controller {
                     self.update_catalog();
                 }
             }
-            Event::DiscoveryDone(error) => {
+            DiscoveryEvent::Done(error) => {
                 self.discovery_job = None;
                 self.app.loading = None;
                 if let Some(error) = error {
                     self.app.set_notice(error, true);
                 }
             }
-            Event::Exit => {}
         }
-        Ok(())
     }
 
     fn apply_status(&mut self, result: std::result::Result<Snapshot, String>) {
@@ -857,9 +877,7 @@ impl Controller {
             },
         };
         if snapshot.service != ServiceState::Active {
-            self.discovery_requested |= self.discovery_job.is_some();
-            abort(&mut self.discovery_job);
-            self.app.loading = None;
+            self.cancel_discovery();
         }
         let error = match &snapshot.service {
             ServiceState::Unavailable(error) => Some(error),
@@ -934,9 +952,9 @@ fn abort(job: &mut Option<JoinHandle<()>>) {
     }
 }
 
-async fn discover(backend: Backend, sender: Sender<Message>, generation: u64) {
+async fn discover(backend: Backend, sender: Sender<Message>, generation: u64, run: u64) {
     let mut errors = Vec::new();
-    if let Err(error) = discover_inner(backend, &sender, generation, &mut errors).await {
+    if let Err(error) = discover_inner(backend, &sender, generation, run, &mut errors).await {
         errors.push(format!("{error:#}"));
     }
     let error = (!errors.is_empty()).then(|| {
@@ -948,7 +966,10 @@ async fn discover(backend: Backend, sender: Sender<Message>, generation: u64) {
     });
     let _ = sender.send(Message {
         generation,
-        event: Event::DiscoveryDone(error),
+        event: Event::Discovery {
+            run,
+            event: DiscoveryEvent::Done(error),
+        },
     });
 }
 
@@ -956,6 +977,7 @@ async fn discover_inner(
     backend: Backend,
     sender: &Sender<Message>,
     generation: u64,
+    run: u64,
     errors: &mut Vec<String>,
 ) -> Result<()> {
     if backend.service_state().await? != ServiceState::Active {
@@ -965,14 +987,17 @@ async fn discover_inner(
     let total = countries.len();
     let _ = sender.send(Message {
         generation,
-        event: Event::Countries(countries.clone()),
+        event: Event::Discovery {
+            run,
+            event: DiscoveryEvent::Countries(countries.clone()),
+        },
     });
     let finished = AtomicUsize::new(0);
     for batch in countries.chunks(4) {
         // These futures belong to the discovery job. Aborting and joining that job
         // drops all four children before shutdown awaits the backend's reapers.
         let query =
-            |country| query_country(&backend, sender, generation, country, &finished, total);
+            |country| query_country(&backend, sender, generation, run, country, &finished, total);
         let results = tokio::join!(
             query(batch.first()),
             query(batch.get(1)),
@@ -992,6 +1017,7 @@ async fn query_country(
     backend: &Backend,
     sender: &Sender<Message>,
     generation: u64,
+    run: u64,
     country: Option<&String>,
     finished: &AtomicUsize,
     total: usize,
@@ -1008,11 +1034,14 @@ async fn query_country(
     let finished = finished.fetch_add(1, Ordering::Relaxed) + 1;
     let _ = sender.send(Message {
         generation,
-        event: Event::Cities {
-            country: country.clone(),
-            result,
-            finished,
-            total,
+        event: Event::Discovery {
+            run,
+            event: DiscoveryEvent::Cities {
+                country: country.clone(),
+                result,
+                finished,
+                total,
+            },
         },
     });
     error
@@ -1204,6 +1233,129 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn discovery_controller(runtime: &Runtime) -> Controller {
+        let backend = Backend::with_programs(
+            "/nonexistent/test-nordvpn".into(),
+            "/nonexistent/test-systemctl".into(),
+            "/nonexistent/test-sudo".into(),
+        );
+        let mut controller = Controller::new(backend, runtime.handle().clone());
+        controller.cache_path = None;
+        controller.catalog = Catalog::default();
+        controller.catalog.set_countries(&["United_States".into()]);
+        controller
+            .catalog
+            .set_cities("United_States".into(), vec!["New_York".into()]);
+        controller.app = App::new(controller.catalog.locations());
+        controller.apply_status(Ok(Snapshot {
+            service: ServiceState::Active,
+            vpn: Some(crate::backend::parse_status("Status: Disconnected\n")),
+        }));
+        controller.app.open_search();
+        controller.tick();
+        controller
+    }
+
+    fn stale_discovery_events() -> [DiscoveryEvent; 3] {
+        [
+            DiscoveryEvent::Countries(vec!["Japan".into()]),
+            DiscoveryEvent::Cities {
+                country: "United_States".into(),
+                result: Ok(vec!["Los_Angeles".into()]),
+                finished: 1,
+                total: 2,
+            },
+            DiscoveryEvent::Done(Some("Old discovery failed".into())),
+        ]
+    }
+
+    #[test]
+    fn canceled_discovery_replies_cannot_restore_progress_or_change_cache_after_service_restart() {
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let mut controller = discovery_controller(&runtime);
+        let directory = tempfile::tempdir().unwrap();
+        let cache_path = directory.path().join("locations.json");
+        controller.catalog.save(&cache_path).unwrap();
+        controller.cache_path = Some(cache_path.clone());
+        let original_cache = std::fs::read(&cache_path).unwrap();
+        let original_locations = controller.catalog.locations();
+        let run = controller.discovery_generation;
+        let action_generation = controller.generation;
+        controller.app.show_panel();
+        controller.apply_status(Ok(Snapshot {
+            service: ServiceState::Inactive,
+            vpn: None,
+        }));
+        assert_eq!(controller.generation, action_generation);
+        for event in stale_discovery_events() {
+            controller.apply_discovery(run, event);
+            assert_eq!(controller.app.loading, None);
+            assert_eq!(controller.catalog.locations(), original_locations);
+        }
+        for _ in 0..3 {
+            controller.apply_status(Ok(Snapshot {
+                service: ServiceState::Active,
+                vpn: Some(crate::backend::parse_status("Status: Disconnected\n")),
+            }));
+            controller.tick();
+            assert_eq!(controller.app.loading, None);
+            assert!(!controller.app.is_working());
+            assert!(controller.discovery_job.is_none());
+        }
+        assert!(controller.discovery_requested);
+        assert!(controller.app.notice.is_none());
+        assert_eq!(controller.catalog.locations(), original_locations);
+        assert_eq!(std::fs::read(cache_path).unwrap(), original_cache);
+        controller.app.open_search();
+        controller.tick();
+        assert!(controller.discovery_job.is_some());
+        assert_eq!(controller.app.loading, Some((0, 0)));
+    }
+
+    #[test]
+    fn old_discovery_completion_cannot_clear_a_new_run_but_current_replies_work_in_panel() {
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let mut controller = discovery_controller(&runtime);
+        let old_run = controller.discovery_generation;
+        controller.cancel_discovery();
+        controller.tick();
+        let run = controller.discovery_generation;
+        assert_ne!(run, old_run);
+        let job_id = controller.discovery_job.as_ref().unwrap().id();
+        let locations = controller.catalog.locations();
+        for event in stale_discovery_events() {
+            controller.apply_discovery(old_run, event);
+        }
+        assert_eq!(controller.discovery_job.as_ref().unwrap().id(), job_id);
+        assert_eq!(controller.app.loading, Some((0, 0)));
+        assert_eq!(controller.catalog.locations(), locations);
+        assert!(controller.app.notice.is_none());
+        controller.app.show_panel();
+        controller.apply_discovery(run, DiscoveryEvent::Countries(vec!["Japan".into()]));
+        controller.apply_discovery(
+            run,
+            DiscoveryEvent::Cities {
+                country: "Japan".into(),
+                result: Ok(vec!["Tokyo".into()]),
+                finished: 1,
+                total: 1,
+            },
+        );
+        assert_eq!(controller.app.loading, Some((1, 1)));
+        assert!(controller.catalog.locations().iter().any(|location| {
+            location.country == "Japan" && location.city.as_deref() == Some("Tokyo")
+        }));
+        controller.apply_discovery(run, DiscoveryEvent::Done(None));
+        assert!(controller.discovery_job.is_none());
+        assert_eq!(controller.app.loading, None);
+        assert!(!controller.discovery_requested);
+        controller.apply_discovery(
+            run,
+            DiscoveryEvent::Done(Some("Duplicate completion".into())),
+        );
+        assert!(controller.app.notice.is_none());
     }
 
     #[test]
