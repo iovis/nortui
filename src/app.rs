@@ -11,10 +11,11 @@ use crossterm::event::{
     KeyEventKind, KeyModifiers,
 };
 use crossterm::execute;
-use crossterm::terminal::{Clear, ClearType};
+use crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, enable_raw_mode};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
-use ratatui::DefaultTerminal;
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 use ratatui::widgets::ListState;
 use tokio::runtime::{Builder, Handle, Runtime};
 use tokio::task::JoinHandle;
@@ -27,9 +28,15 @@ use crate::ui;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mode {
+    #[default]
+    Panel,
+    Search,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ItemKind {
-    Command,
     Country,
     City,
 }
@@ -37,7 +44,6 @@ pub enum ItemKind {
 impl ItemKind {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Command => "Command",
             Self::Country => "Country",
             Self::City => "City",
         }
@@ -59,6 +65,7 @@ pub struct Notice {
 }
 
 pub struct App {
+    pub mode: Mode,
     pub query: String,
     pub snapshot: Snapshot,
     pub locations: Vec<Location>,
@@ -74,6 +81,7 @@ pub struct App {
 impl App {
     pub fn new(locations: Vec<Location>) -> Self {
         let mut app = Self {
+            mode: Mode::Panel,
             query: String::new(),
             snapshot: Snapshot::default(),
             locations,
@@ -116,34 +124,98 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Input {
-        if key.kind == KeyEventKind::Release {
+        if key.kind == KeyEventKind::Release
+            || key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::SUPER)
+        {
             return Input::None;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return match key.code {
                 KeyCode::Char('c') => Input::Exit,
-                KeyCode::Char('n' | 'j') => {
+                KeyCode::Char('r') if key.kind == KeyEventKind::Press => {
+                    Input::Execute(Action::Refresh)
+                }
+                KeyCode::Char('n' | 'j') if self.mode == Mode::Search => {
                     self.move_selection(1);
                     Input::None
                 }
-                KeyCode::Char('p' | 'k') => {
+                KeyCode::Char('p' | 'k') if self.mode == Mode::Search => {
                     self.move_selection(-1);
                     Input::None
                 }
-                KeyCode::Char('u') => {
+                KeyCode::Char('u') if self.mode == Mode::Search => {
                     self.query.clear();
                     self.rebuild(false);
                     Input::None
                 }
-                KeyCode::Char('r') => Input::Execute(Action::Refresh),
                 _ => Input::None,
             };
         }
+        match self.mode {
+            Mode::Panel if key.kind == KeyEventKind::Press => self.handle_panel_key(key.code),
+            Mode::Panel => Input::None,
+            Mode::Search => self.handle_search_key(key),
+        }
+    }
+
+    pub fn open_search(&mut self) {
+        self.mode = Mode::Search;
+        self.query.clear();
+        self.rebuild(false);
+    }
+
+    fn show_panel(&mut self) {
+        self.mode = Mode::Panel;
+        self.query.clear();
+        self.rebuild(false);
+    }
+
+    fn handle_panel_key(&mut self, code: KeyCode) -> Input {
+        match code {
+            KeyCode::Char('i' | '/') => {
+                self.open_search();
+                Input::None
+            }
+            KeyCode::Char('c') => Input::Execute(
+                if self.snapshot.service == ServiceState::Active
+                    && self
+                        .snapshot
+                        .vpn
+                        .as_ref()
+                        .is_some_and(|vpn| vpn.state == VpnState::Connected)
+                {
+                    Action::Reconnect
+                } else {
+                    Action::Connect(None)
+                },
+            ),
+            KeyCode::Char('d') => Input::Execute(Action::Disconnect),
+            KeyCode::Char('s') => match self.snapshot.service {
+                ServiceState::Active => Input::Execute(Action::StopService),
+                ServiceState::Inactive | ServiceState::Failed => {
+                    Input::Execute(Action::StartService)
+                }
+                ServiceState::Activating | ServiceState::Deactivating => {
+                    self.set_notice("Service change is still in progress", false);
+                    Input::None
+                }
+                ServiceState::Unavailable(_) => {
+                    self.set_notice("Service state unavailable; refresh to check again", true);
+                    Input::None
+                }
+            },
+            KeyCode::Char('r') => Input::Execute(Action::Refresh),
+            KeyCode::Char('q') | KeyCode::Esc => Input::Exit,
+            _ => Input::None,
+        }
+    }
+
+    fn handle_search_key(&mut self, key: KeyEvent) -> Input {
         match key.code {
-            KeyCode::Esc if self.query.is_empty() => Input::Exit,
             KeyCode::Esc => {
-                self.query.clear();
-                self.rebuild(false);
+                self.show_panel();
                 Input::None
             }
             KeyCode::Down => {
@@ -162,10 +234,18 @@ impl App {
                 self.move_selection(-10);
                 Input::None
             }
-            KeyCode::Enter => self
-                .results
-                .get(self.selected)
-                .map_or(Input::None, |row| Input::Execute(row.action.clone())),
+            KeyCode::Enter if key.kind == KeyEventKind::Press && self.busy.is_none() => {
+                let action = self
+                    .results
+                    .get(self.selected)
+                    .map(|row| row.action.clone());
+                if let Some(action) = action {
+                    self.show_panel();
+                    Input::Execute(action)
+                } else {
+                    Input::None
+                }
+            }
             KeyCode::Backspace => {
                 if let Some((index, _)) = self.query.grapheme_indices(true).next_back() {
                     self.query.truncate(index);
@@ -183,6 +263,9 @@ impl App {
     }
 
     pub fn paste(&mut self, value: &str) {
+        if self.mode != Mode::Search {
+            return;
+        }
         self.query
             .extend(value.chars().filter(|character| !character.is_control()));
         self.rebuild(false);
@@ -200,6 +283,17 @@ impl App {
     }
 
     fn vpn_text(&self, details: bool) -> String {
+        if self.mode == Mode::Panel {
+            return match self.snapshot.vpn.as_ref().map(|vpn| &vpn.state) {
+                Some(VpnState::Connected) => "Connected",
+                Some(VpnState::Connecting) => "Connecting…",
+                Some(VpnState::Disconnected) => "Disconnected",
+                Some(VpnState::Paused) => "Paused",
+                Some(VpnState::Unavailable(_)) => "VPN unavailable",
+                None => "Checking VPN…",
+            }
+            .into();
+        }
         let Some(vpn) = &self.snapshot.vpn else {
             return "Service running · Checking VPN…".into();
         };
@@ -238,41 +332,8 @@ impl App {
     }
 
     fn candidates(&self) -> Vec<SearchResult> {
-        let mut rows = Vec::new();
-        let connected = self
-            .snapshot
-            .vpn
-            .as_ref()
-            .is_some_and(|vpn| matches!(vpn.state, VpnState::Connected));
-        let connect = if connected {
-            Action::Reconnect
-        } else {
-            Action::Connect(None)
-        };
-        rows.push(command_row(
-            if connected {
-                "Reconnect"
-            } else {
-                "Connect recommended"
-            },
-            connect,
-        ));
-        if self.snapshot.service == ServiceState::Active {
-            if self.snapshot.vpn.as_ref().is_some_and(|vpn| {
-                !matches!(vpn.state, VpnState::Disconnected | VpnState::Unavailable(_))
-            }) {
-                rows.push(command_row("Disconnect", Action::Disconnect));
-            }
-            rows.push(command_row("Stop service", Action::StopService));
-        } else if matches!(
-            self.snapshot.service,
-            ServiceState::Inactive | ServiceState::Failed
-        ) {
-            rows.push(command_row("Start service", Action::StartService));
-        }
-        rows.push(command_row("Refresh", Action::Refresh));
-        if self.query.trim().is_empty() {
-            return rows;
+        if self.mode == Mode::Panel {
+            return Vec::new();
         }
         let mut locations: Vec<_> = self
             .locations
@@ -293,8 +354,7 @@ impl App {
                 .cmp(&right.kind)
                 .then_with(|| left.label.cmp(&right.label))
         });
-        rows.extend(locations);
-        rows
+        locations
     }
 
     fn rebuild(&mut self, preserve: bool) {
@@ -344,15 +404,6 @@ impl App {
             .unwrap_or(0);
         self.list_state
             .select((!self.results.is_empty()).then_some(self.selected));
-    }
-}
-
-fn command_row(label: &str, action: Action) -> SearchResult {
-    SearchResult {
-        label: label.into(),
-        kind: ItemKind::Command,
-        action,
-        matches: Vec::new(),
     }
 }
 
@@ -769,25 +820,66 @@ async fn query_country(
     error
 }
 
+// Ratatui's Terminal::drop prints a failed cursor-restoration error to stderr.
+// Ignore writes only after stdout's terminal has closed, so that hidden-cursor
+// cleanup cannot recursively panic before the controller reaps its children.
+struct TerminalOutput(io::Stdout);
+
+impl io::Write for TerminalOutput {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        match io::Write::write(&mut self.0, buffer) {
+            Err(_) if !self.0.is_terminal() => Ok(buffer.len()),
+            result => result,
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match io::Write::flush(&mut self.0) {
+            Err(_) if !self.0.is_terminal() => Ok(()),
+            result => result,
+        }
+    }
+}
+
+type WidgetTerminal = Terminal<CrosstermBackend<TerminalOutput>>;
+
 struct TerminalSession {
-    terminal: DefaultTerminal,
+    terminal: WidgetTerminal,
 }
 
 impl TerminalSession {
     fn new() -> Result<Self> {
-        let terminal = ratatui::try_init().context("Cannot initialize terminal")?;
-        let session = Self { terminal };
-        execute!(io::stdout(), EnableBracketedPaste)?;
-        Ok(session)
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |information| {
+            let _ = ratatui::try_restore();
+            previous_hook(information);
+        }));
+        Ok(Self {
+            terminal: Self::initialize().context("Cannot initialize terminal")?,
+        })
+    }
+
+    fn initialize() -> Result<WidgetTerminal> {
+        let result = (|| {
+            enable_raw_mode()?;
+            execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+            Ok(Terminal::new(CrosstermBackend::new(TerminalOutput(
+                io::stdout(),
+            )))?)
+        })();
+        if result.is_err() {
+            let _ = ratatui::try_restore();
+        }
+        result
     }
 
     fn suspend<T>(&mut self, operation: impl FnOnce() -> T) -> Result<T> {
         execute!(io::stdout(), DisableBracketedPaste)?;
+        self.terminal.show_cursor()?;
         ratatui::try_restore().context("Cannot restore terminal for authentication")?;
         let result = operation();
         self.terminal =
-            ratatui::try_init().context("Cannot restore terminal after authentication")?;
-        execute!(io::stdout(), EnableBracketedPaste)?;
+            Self::initialize().context("Cannot restore terminal after authentication")?;
         // Fullscreen reinitialization already resets Ratatui's buffers. Clear
         // directly: Terminal::clear queries cursor position unnecessarily here.
         execute!(io::stdout(), Clear(ClearType::All))?;
@@ -904,6 +996,7 @@ mod tests {
             country: "United_States".into(),
             city: Some("New_York".into()),
         }]);
+        app.open_search();
         app.paste("new york");
         assert_eq!(app.results.len(), 1);
         assert!(!app.results[0].matches.is_empty());
@@ -914,20 +1007,30 @@ mod tests {
                 city: Some("New_York".into())
             })))
         );
+        assert_eq!(app.mode, Mode::Panel);
+        assert!(app.query.is_empty());
+        assert!(app.results.is_empty());
     }
 
     #[test]
-    fn ordinary_q_is_search_and_escape_clears_before_exiting() {
+    fn search_letters_never_trigger_panel_shortcuts_and_escape_returns_to_panel() {
         let mut app = App::new(Vec::new());
-        assert_eq!(app.handle_key(key(KeyCode::Char('q'))), Input::None);
-        assert_eq!(app.query, "q");
+        app.open_search();
+        for letter in "cdsrqi/".chars() {
+            assert_eq!(app.handle_key(key(KeyCode::Char(letter))), Input::None);
+        }
+        assert_eq!(app.query, "cdsrqi/");
         assert_eq!(app.handle_key(key(KeyCode::Esc)), Input::None);
+        assert_eq!(app.mode, Mode::Panel);
         assert!(app.query.is_empty());
+        assert_eq!(app.handle_key(key(KeyCode::Char('q'))), Input::Exit);
+        app.open_search();
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Input::None);
         assert_eq!(app.handle_key(key(KeyCode::Esc)), Input::Exit);
     }
 
     #[test]
-    fn locations_only_appear_during_search_and_hide_again_after_clear() {
+    fn panel_has_no_results_and_both_search_keys_open_locations_without_inserting_text() {
         let mut app = App::new(vec![
             Location {
                 country: "Japan".into(),
@@ -938,33 +1041,163 @@ mod tests {
                 city: Some("Tokyo".into()),
             },
         ]);
-        assert!(app.results.iter().all(|row| row.kind == ItemKind::Command));
-        app.paste("japan");
-        assert_eq!(app.results.len(), 2);
-        assert_eq!(app.results[0].kind, ItemKind::Country);
-        assert_eq!(app.results[1].kind, ItemKind::City);
-        app.handle_key(key(KeyCode::Esc));
-        app.paste("  ");
-        assert!(!app.results.is_empty());
-        assert!(app.results.iter().all(|row| row.kind == ItemKind::Command));
-        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(app.mode, Mode::Panel);
+        assert!(app.results.is_empty());
+        app.paste("s");
         assert!(app.query.is_empty());
-        assert!(app.results.iter().all(|row| row.kind == ItemKind::Command));
+        for trigger in ['i', '/'] {
+            assert_eq!(app.handle_key(key(KeyCode::Char(trigger))), Input::None);
+            assert_eq!(app.mode, Mode::Search);
+            assert!(app.query.is_empty());
+            assert_eq!(app.results.len(), 2);
+            assert_eq!(app.results[0].kind, ItemKind::Country);
+            assert_eq!(app.results[1].kind, ItemKind::City);
+            app.paste("japan");
+            app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+            assert!(app.query.is_empty());
+            assert_eq!(app.results.len(), 2);
+            app.handle_key(key(KeyCode::Esc));
+            assert!(app.results.is_empty());
+        }
     }
 
     #[test]
     fn control_j_k_move_selection_without_changing_search() {
-        let mut app = App::new(Vec::new());
+        let mut app = App::new(vec![
+            Location {
+                country: "Japan".into(),
+                city: None,
+            },
+            Location {
+                country: "Japan".into(),
+                city: Some("Tokyo".into()),
+            },
+        ]);
+        app.open_search();
         assert_eq!(app.selected, 0);
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)),
             Input::None
         );
-        assert_eq!(app.results[app.selected].action, Action::Refresh);
+        assert_eq!(app.results[app.selected].kind, ItemKind::City);
         app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
         assert_eq!(app.selected, 0);
         app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
         assert_eq!(app.selected, 0);
+        assert!(app.query.is_empty());
+    }
+
+    #[test]
+    fn panel_shortcuts_choose_connect_disconnect_refresh_and_observed_service_toggle() {
+        let mut app = App::new(Vec::new());
+        app.set_snapshot(Snapshot {
+            service: ServiceState::Inactive,
+            vpn: None,
+        });
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('c'))),
+            Input::Execute(Action::Connect(None))
+        );
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('d'))),
+            Input::Execute(Action::Disconnect)
+        );
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('r'))),
+            Input::Execute(Action::Refresh)
+        );
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('s'))),
+            Input::Execute(Action::StartService)
+        );
+        app.set_snapshot(Snapshot {
+            service: ServiceState::Active,
+            vpn: Some(crate::model::VpnStatus {
+                state: VpnState::Connected,
+                country: None,
+                city: None,
+                ip: None,
+                technology: None,
+            }),
+        });
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('c'))),
+            Input::Execute(Action::Reconnect)
+        );
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('s'))),
+            Input::Execute(Action::StopService)
+        );
+        app.snapshot.service = ServiceState::Inactive;
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('c'))),
+            Input::Execute(Action::Connect(None))
+        );
+        for service in [
+            ServiceState::Activating,
+            ServiceState::Deactivating,
+            ServiceState::Unavailable("cannot query systemd".into()),
+        ] {
+            app.snapshot.service = service;
+            assert_eq!(app.handle_key(key(KeyCode::Char('s'))), Input::None);
+            assert!(app.notice.is_some());
+        }
+        app.snapshot.service = ServiceState::Failed;
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('s'))),
+            Input::Execute(Action::StartService)
+        );
+    }
+
+    #[test]
+    fn repeated_or_modified_panel_keys_do_not_run_actions() {
+        let mut app = App::new(Vec::new());
+        for character in "cdsri/q".chars() {
+            let mut repeated = key(KeyCode::Char(character));
+            repeated.kind = KeyEventKind::Repeat;
+            assert_eq!(app.handle_key(repeated), Input::None);
+            repeated.kind = KeyEventKind::Release;
+            assert_eq!(app.handle_key(repeated), Input::None);
+            assert_eq!(
+                app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::ALT)),
+                Input::None
+            );
+        }
+        assert_eq!(app.mode, Mode::Panel);
+        assert!(app.query.is_empty());
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Input::Exit
+        );
+        app.open_search();
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Input::Exit
+        );
+    }
+
+    #[test]
+    fn empty_or_busy_picker_selection_does_not_leave_search_or_start_action() {
+        let mut app = App::new(Vec::new());
+        app.open_search();
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Input::None);
+        assert_eq!(app.mode, Mode::Search);
+        app.set_locations(vec![Location {
+            country: "Japan".into(),
+            city: None,
+        }]);
+        app.busy = Some(Action::Connect(None));
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Input::None);
+        assert_eq!(app.mode, Mode::Search);
+    }
+
+    #[test]
+    fn search_backspace_removes_a_whole_grapheme_and_sanitizes_paste() {
+        let mut app = App::new(Vec::new());
+        app.open_search();
+        app.paste("e\u{301}\n\u{1b}");
+        assert_eq!(app.query, "e\u{301}");
+        app.handle_key(key(KeyCode::Backspace));
         assert!(app.query.is_empty());
     }
 
@@ -980,6 +1213,7 @@ mod tests {
                 city: None,
             },
         ]);
+        app.open_search();
         app.paste("united states");
         assert_eq!(app.results[0].kind, ItemKind::Country);
         app.query.clear();
@@ -989,14 +1223,34 @@ mod tests {
 
     #[test]
     fn progressive_locations_preserve_selected_action() {
-        let mut app = App::new(Vec::new());
+        let mut app = App::new(vec![
+            Location {
+                country: "Japan".into(),
+                city: None,
+            },
+            Location {
+                country: "United_States".into(),
+                city: None,
+            },
+        ]);
+        app.open_search();
         app.move_selection(1);
-        assert_eq!(app.results[app.selected].action, Action::Refresh);
-        app.set_locations(vec![Location {
-            country: "Japan".into(),
-            city: None,
-        }]);
-        assert_eq!(app.results[app.selected].action, Action::Refresh);
+        let selected = app.results[app.selected].action.clone();
+        app.set_locations(vec![
+            Location {
+                country: "Australia".into(),
+                city: None,
+            },
+            Location {
+                country: "Japan".into(),
+                city: None,
+            },
+            Location {
+                country: "United_States".into(),
+                city: None,
+            },
+        ]);
+        assert_eq!(app.results[app.selected].action, selected);
         app.paste("no-such-location");
         assert!(app.results.is_empty());
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Input::None);

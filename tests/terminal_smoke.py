@@ -88,6 +88,7 @@ class Screen:
         self.x = self.y = 0
         self.rows = [[" "] * width for _ in range(height)]
         self.pending = ""
+        self.cursor_visible = False
 
     def feed(self, text):
         self.pending += text
@@ -99,6 +100,8 @@ class Screen:
                 parameters, _, command = match.groups()
                 self.pending = self.pending[match.end():]
                 if parameters.startswith("?"):
+                    if parameters == "?25":
+                        self.cursor_visible = command == "h"
                     if parameters == "?1049" and command == "h":
                         self.rows = [[" "] * self.width for _ in range(self.height)]
                         self.x = self.y = 0
@@ -230,23 +233,31 @@ class TerminalSmoke(unittest.TestCase):
         widget = self.widget()
         widget.wait_for(lambda: "Service stopped" in widget.text())
         self.assertIn("Start service to load locations", widget.text())
+        self.assertIn("Technology", widget.text())
+        self.assertNotIn("Search countries", widget.text())
+        self.assertFalse(widget.screen.cursor_visible)
         self.assertFalse(any(command[0] == "nordvpn" for command in widget.commands()))
-        widget.send(b"q")
+        widget.send(b"iq")
         widget.wait_for(lambda: "No matches" in widget.text())
+        self.assertTrue(widget.screen.cursor_visible)
         widget.send(b"\x1b")
-        widget.wait_for(lambda: "Connect recommended" in widget.text())
-        widget.send(b"\x1b")
+        widget.wait_for(lambda: "Technology" in widget.text())
+        self.assertFalse(widget.screen.cursor_visible)
+        widget.send(b"q")
         self.assertEqual(widget.process.wait(timeout=3), 0)
         self.assertEqual(termios.tcgetattr(widget.slave)[3], widget.original_flags)
 
     def test_cached_city_authenticates_in_cooked_mode_then_connects(self):
         widget = self.widget(cached=True)
         widget.wait_for(lambda: "Service stopped" in widget.text())
-        widget.send(b"new york\r")
+        widget.send(b"/new york\r")
         widget.wait_for(lambda: b"AUTH_COOKED" in widget.raw)
         widget.send(b"password\n")
         widget.wait_for(lambda: ["nordvpn", "connect", "United_States", "New_York"] in widget.commands())
         widget.wait_for(lambda: "Connected" in widget.text())
+        self.assertIn("192.0.2.10", widget.text())
+        self.assertIn("NORDLYNX", widget.text())
+        self.assertNotIn("Search countries", widget.text())
         self.assertIsNone(widget.process.poll())
         self.assertFalse(termios.tcgetattr(widget.slave)[3] & termios.ICANON)
 
@@ -255,21 +266,23 @@ class TerminalSmoke(unittest.TestCase):
             with self.subTest(exit_code=failure):
                 widget = self.widget(cached=True, NORTUI_AUTH_FAILURE=failure)
                 widget.wait_for(lambda: "Service stopped" in widget.text())
-                widget.send(b"new york\r")
+                widget.send(b"/new york\r")
                 widget.wait_for(lambda: b"AUTH_COOKED" in widget.raw)
                 widget.send(b"password\n")
                 widget.wait_for(lambda: "Sudo authentication was canceled or failed" in widget.text())
                 self.assertFalse(any(command[:2] == ["nordvpn", "connect"] for command in widget.commands()))
                 self.assertEqual((widget.root / "service").read_text(), "inactive")
                 self.assertFalse(termios.tcgetattr(widget.slave)[3] & termios.ICANON)
+                self.assertIn("Technology", widget.text())
+                self.assertFalse(widget.screen.cursor_visible)
 
     def test_slow_connection_keeps_search_responsive_and_exit_reaps_child(self):
         widget = self.widget(service="active", cached=True, NORTUI_CONNECT_DELAY="10")
         widget.wait_for(lambda: "Disconnected" in widget.text())
-        widget.send(b"new york\r")
+        widget.send(b"/new york\r")
         widget.wait_for(lambda: (widget.root / "connect.pid").exists())
         pid = int((widget.root / "connect.pid").read_text())
-        widget.send(b"\r\r\x15Tokyo")
+        widget.send(b"cc/Tokyo\r\r")
         widget.wait_for(lambda: "Tokyo" in widget.text().splitlines()[0])
         self.assertEqual(sum(command[:2] == ["nordvpn", "connect"] for command in widget.commands()), 1)
         widget.send(b"\x03")
@@ -285,7 +298,7 @@ class TerminalSmoke(unittest.TestCase):
         (widget.root / "service").write_text("inactive")
         widget.wait_for(lambda: "Service stopped" in widget.text())
         before = sum(command[0] == "nordvpn" for command in widget.commands())
-        widget.send(b"\x12")
+        widget.send(b"r")
         widget.pump(0.5)
         self.assertEqual(sum(command[0] == "nordvpn" for command in widget.commands()), before)
 
@@ -309,7 +322,7 @@ class TerminalSmoke(unittest.TestCase):
     def test_closing_terminal_during_connection_reaps_child(self):
         widget = self.widget(service="active", cached=True, NORTUI_CONNECT_DELAY="10")
         widget.wait_for(lambda: "Disconnected" in widget.text())
-        widget.send(b"new york\r")
+        widget.send(b"/new york\r")
         widget.wait_for(lambda: (widget.root / "connect.pid").exists())
         pid = int((widget.root / "connect.pid").read_text())
         widget.pump(0.1)
@@ -323,22 +336,68 @@ class TerminalSmoke(unittest.TestCase):
         widget = self.widget()
         (widget.root / "credentials").touch()
         widget.wait_for(lambda: "Service stopped" in widget.text())
-        widget.send(b"start service\r")
-        widget.wait_for(lambda: "Service running · Disconnected" in widget.text())
-        widget.wait_for(lambda: "Tokyo" in json.dumps(json.loads((widget.root / "cache/nortui/locations.json").read_text())))
-        widget.send(b"\x15united states\r")
+        widget.send(b"s")
+        widget.wait_for(lambda: "Disconnected" in widget.text())
+        cache = widget.root / "cache/nortui/locations.json"
+        widget.wait_for(lambda: cache.exists() and "Tokyo" in cache.read_text())
+        widget.send(b"/united states\r")
         widget.wait_for(lambda: "Connected" in widget.text() and "You are connected" in widget.text())
         self.assertIn(["nordvpn", "connect", "United_States"], widget.commands())
-        widget.send(b"\x15reconnect\r")
+        widget.send(b"c")
         widget.wait_for(lambda: ["nordvpn", "connect"] in widget.commands())
-        widget.pump(0.3)
-        widget.send(b"\x15disconnect\r")
-        widget.wait_for(lambda: "Service running · Disconnected" in widget.text())
+        widget.wait_for(lambda: "You are connected" in widget.text() and "Connecting to recommended" not in widget.text())
+        widget.send(b"d")
+        widget.wait_for(lambda: "Disconnected" in widget.text())
         self.assertEqual((widget.root / "service").read_text(), "active")
-        widget.send(b"\x15stop service\r")
+        self.assertNotIn("192.0.2.10", widget.text())
+        widget.send(b"s")
         widget.wait_for(lambda: "Service stopped" in widget.text())
         self.assertEqual((widget.root / "service").read_text(), "inactive")
         self.assertFalse(any("enable" in command or "disable" in command for command in widget.commands()))
+
+    def test_search_letters_never_execute_panel_actions_or_exit(self):
+        widget = self.widget(cached=True)
+        widget.wait_for(lambda: "Service stopped" in widget.text())
+        for trigger in (b"i", b"/"):
+            widget.send(trigger)
+            widget.wait_for(lambda: "Search countries and cities" in widget.text())
+            self.assertIn("Country", widget.text())
+            self.assertIn("City", widget.text())
+            widget.send(b"cdsrqi/")
+            widget.wait_for(lambda: "cdsrqi/" in widget.text().splitlines()[0])
+            self.assertIsNone(widget.process.poll())
+            self.assertEqual((widget.root / "service").read_text(), "inactive")
+            self.assertFalse(any(command[0] in ("nordvpn", "sudo") for command in widget.commands()))
+            widget.send(b"\x1b")
+            widget.wait_for(lambda: "Technology" in widget.text())
+            self.assertFalse(widget.screen.cursor_visible)
+        widget.send(b"q")
+        self.assertEqual(widget.process.wait(timeout=3), 0)
+
+    def test_picker_navigation_connects_a_city_and_returns_to_panel(self):
+        widget = self.widget(cached=True)
+        (widget.root / "credentials").touch()
+        widget.wait_for(lambda: "Service stopped" in widget.text())
+        widget.send(b"i")
+        widget.wait_for(lambda: "Search countries and cities" in widget.text())
+        # Cached results are country then city; Ctrl-J/K move without typing.
+        widget.send(b"\x0a\x0b\x0a\r")
+        widget.wait_for(lambda: ["nordvpn", "connect", "United_States", "New_York"] in widget.commands())
+        widget.wait_for(lambda: "Connected" in widget.text())
+        self.assertIn("Technology", widget.text())
+        self.assertFalse(widget.screen.cursor_visible)
+
+    def test_connect_shortcut_starts_stopped_service_and_connects_without_location(self):
+        widget = self.widget()
+        (widget.root / "credentials").touch()
+        widget.wait_for(lambda: "Service stopped" in widget.text())
+        widget.send(b"c")
+        widget.wait_for(lambda: "Connected" in widget.text())
+        commands = widget.commands()
+        self.assertIn(["systemctl", "start", "nordvpnd.service"], commands)
+        self.assertIn(["nordvpn", "connect"], commands)
+        self.assertLess(commands.index(["systemctl", "start", "nordvpnd.service"]), commands.index(["nordvpn", "connect"]))
+        self.assertNotIn("Search countries", widget.text())
 
 
 if __name__ == "__main__":
