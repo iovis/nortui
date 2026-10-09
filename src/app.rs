@@ -1,4 +1,3 @@
-use std::fmt::Write;
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -27,6 +26,7 @@ use crate::model::{Action, Location, ServiceState, Snapshot, VpnState};
 use crate::ui;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+const REFRESH_NOTICE: &str = "Refreshing status and locations…";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Mode {
@@ -271,20 +271,14 @@ impl App {
         self.rebuild(false);
     }
 
-    pub fn status_text(&self, details: bool) -> String {
+    pub fn status_text(&self) -> String {
         match &self.snapshot.service {
             ServiceState::Inactive => "Service stopped".into(),
             ServiceState::Activating => "Service starting…".into(),
             ServiceState::Deactivating => "Service stopping…".into(),
             ServiceState::Failed => "Service failed".into(),
             ServiceState::Unavailable(_) => "Service unavailable".into(),
-            ServiceState::Active => self.vpn_text(details),
-        }
-    }
-
-    fn vpn_text(&self, details: bool) -> String {
-        if self.mode == Mode::Panel {
-            return match self.snapshot.vpn.as_ref().map(|vpn| &vpn.state) {
+            ServiceState::Active => match self.snapshot.vpn.as_ref().map(|vpn| &vpn.state) {
                 Some(VpnState::Connected) => "Connected",
                 Some(VpnState::Connecting) => "Connecting…",
                 Some(VpnState::Disconnected) => "Disconnected",
@@ -292,32 +286,8 @@ impl App {
                 Some(VpnState::Unavailable(_)) => "VPN unavailable",
                 None => "Checking VPN…",
             }
-            .into();
+            .into(),
         }
-        let Some(vpn) = &self.snapshot.vpn else {
-            return "Service running · Checking VPN…".into();
-        };
-        let mut text = match vpn.state {
-            VpnState::Connected => "Connected".to_owned(),
-            VpnState::Connecting => "Service running · Connecting…".to_owned(),
-            VpnState::Disconnected => "Service running · Disconnected".to_owned(),
-            VpnState::Paused => "Service running · Paused".to_owned(),
-            VpnState::Unavailable(_) => "Service running · VPN unavailable".to_owned(),
-        };
-        if matches!(vpn.state, VpnState::Connected) {
-            if let Some(country) = &vpn.country {
-                let _ = write!(text, " · {}", country.replace('_', " "));
-                if let Some(city) = &vpn.city {
-                    let _ = write!(text, " / {}", city.replace('_', " "));
-                }
-            }
-            if details {
-                for value in [&vpn.ip, &vpn.technology].into_iter().flatten() {
-                    let _ = write!(text, " · {value}");
-                }
-            }
-        }
-        text
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -540,8 +510,7 @@ impl Controller {
         abort(&mut self.discovery_job);
         self.app.loading = None;
         if action == Action::Refresh {
-            self.app
-                .set_notice("Refreshing status and locations…", false);
+            self.app.set_notice(REFRESH_NOTICE, false);
             self.spawn_status();
             return;
         }
@@ -689,6 +658,15 @@ impl Controller {
                 .is_some_and(|notice| notice.message == previous.replace(['\n', '\r'], " "))
         }) {
             self.app.notice = None;
+        }
+        if next_error.is_none()
+            && self
+                .app
+                .notice
+                .as_ref()
+                .is_some_and(|notice| !notice.is_error && notice.message == REFRESH_NOTICE)
+        {
+            self.app.set_notice("Status refreshed", false);
         }
         self.status_error = next_error;
         self.app.set_snapshot(snapshot);
@@ -1264,5 +1242,45 @@ mod tests {
         controller.execute(Action::StopService);
         assert_eq!(controller.app.busy, Some(Action::StartService));
         assert!(controller.action_job.is_none());
+    }
+
+    #[test]
+    fn footer_status_is_compact_and_identical_in_both_modes() {
+        let mut app = App::new(Vec::new());
+        app.set_snapshot(Snapshot {
+            service: ServiceState::Active,
+            vpn: Some(crate::model::VpnStatus {
+                state: VpnState::Connected,
+                country: Some("United_States".into()),
+                city: Some("New_York".into()),
+                ip: Some("192.0.2.10".into()),
+                technology: Some("NORDLYNX".into()),
+            }),
+        });
+        assert_eq!(app.status_text(), "Connected");
+        app.open_search();
+        assert_eq!(app.status_text(), "Connected");
+        app.snapshot.service = ServiceState::Inactive;
+        assert_eq!(app.status_text(), "Service stopped");
+    }
+
+    #[test]
+    fn completed_refresh_does_not_leave_the_footer_showing_refresh_in_progress() {
+        let runtime = Runtime::new().unwrap();
+        let mut controller = Controller::new(Backend::new(), runtime.handle().clone());
+        controller.app.set_notice(REFRESH_NOTICE, false);
+        controller.apply_status(Ok(Snapshot {
+            service: ServiceState::Inactive,
+            vpn: None,
+        }));
+        assert_eq!(
+            controller.app.notice.as_ref().unwrap().message,
+            "Status refreshed"
+        );
+        controller.app.set_notice(REFRESH_NOTICE, false);
+        controller.apply_status(Err("Cannot query systemd".into()));
+        let notice = controller.app.notice.as_ref().unwrap();
+        assert!(notice.is_error);
+        assert_eq!(notice.message, "Cannot query systemd");
     }
 }

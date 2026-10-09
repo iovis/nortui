@@ -147,11 +147,11 @@ class Screen:
 
 
 class Widget:
-    def __init__(self, service="inactive", cached=False, **environment):
+    def __init__(self, service="inactive", cached=False, vpn="Disconnected", width=100, height=24, **environment):
         self.directory = tempfile.TemporaryDirectory(prefix="nortui-terminal-")
         self.root = Path(self.directory.name)
         (self.root / "service").write_text(service)
-        (self.root / "vpn").write_text("Disconnected")
+        (self.root / "vpn").write_text(vpn)
         for program in ("nordvpn", "systemctl", "sudo"):
             path = self.root / program
             path.write_text(FAKE)
@@ -161,11 +161,11 @@ class Widget:
             path.parent.mkdir(parents=True)
             path.write_text(json.dumps({"version": 1, "updated_at": 0, "countries": {"United_States": ["New_York"]}}))
         self.master, self.slave = os.openpty()
-        fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+        fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack("HHHH", height, width, 0, 0))
         self.original_flags = termios.tcgetattr(self.slave)[3]
         env = dict(os.environ, TERM="xterm-256color", PATH=f"{self.root}:/usr/bin", NORTUI_FIXTURE=str(self.root), XDG_CACHE_HOME=str(self.root / "cache"), **environment)
         self.process = subprocess.Popen([BINARY], stdin=self.slave, stdout=self.slave, stderr=self.slave, env=env, start_new_session=True)
-        self.screen = Screen()
+        self.screen = Screen(width, height)
         self.raw = b""
 
     def pump(self, seconds=0.05):
@@ -194,6 +194,15 @@ class Widget:
 
     def text(self):
         return self.screen.text()
+
+    def query(self):
+        for line in self.text().splitlines():
+            if line.lstrip().startswith("› "):
+                return line.lstrip()[2:].rstrip()
+        return None
+
+    def footer(self):
+        return self.text().splitlines()[-1]
 
     def send(self, data):
         os.write(self.master, data)
@@ -233,7 +242,9 @@ class TerminalSmoke(unittest.TestCase):
         widget = self.widget()
         widget.wait_for(lambda: "Service stopped" in widget.text())
         self.assertIn("Start service to load locations", widget.text())
-        self.assertIn("Technology", widget.text())
+        self.assertIn("VPN is off", widget.text())
+        self.assertNotIn("Technology", widget.text())
+        self.assertNotIn("—", widget.text())
         self.assertNotIn("Search countries", widget.text())
         self.assertFalse(widget.screen.cursor_visible)
         self.assertFalse(any(command[0] == "nordvpn" for command in widget.commands()))
@@ -241,7 +252,7 @@ class TerminalSmoke(unittest.TestCase):
         widget.wait_for(lambda: "No matches" in widget.text())
         self.assertTrue(widget.screen.cursor_visible)
         widget.send(b"\x1b")
-        widget.wait_for(lambda: "Technology" in widget.text())
+        widget.wait_for(lambda: "VPN is off" in widget.text())
         self.assertFalse(widget.screen.cursor_visible)
         widget.send(b"q")
         self.assertEqual(widget.process.wait(timeout=3), 0)
@@ -257,6 +268,8 @@ class TerminalSmoke(unittest.TestCase):
         widget.wait_for(lambda: "Connected" in widget.text())
         self.assertIn("192.0.2.10", widget.text())
         self.assertIn("NORDLYNX", widget.text())
+        self.assertIn("New York", widget.text())
+        self.assertIn("United States", widget.text())
         self.assertNotIn("Search countries", widget.text())
         self.assertIsNone(widget.process.poll())
         self.assertFalse(termios.tcgetattr(widget.slave)[3] & termios.ICANON)
@@ -273,7 +286,7 @@ class TerminalSmoke(unittest.TestCase):
                 self.assertFalse(any(command[:2] == ["nordvpn", "connect"] for command in widget.commands()))
                 self.assertEqual((widget.root / "service").read_text(), "inactive")
                 self.assertFalse(termios.tcgetattr(widget.slave)[3] & termios.ICANON)
-                self.assertIn("Technology", widget.text())
+                self.assertIn("VPN is off", widget.text())
                 self.assertFalse(widget.screen.cursor_visible)
 
     def test_slow_connection_keeps_search_responsive_and_exit_reaps_child(self):
@@ -282,8 +295,9 @@ class TerminalSmoke(unittest.TestCase):
         widget.send(b"/new york\r")
         widget.wait_for(lambda: (widget.root / "connect.pid").exists())
         pid = int((widget.root / "connect.pid").read_text())
+        widget.wait_for(lambda: "Connecting" in widget.footer())
         widget.send(b"cc/Tokyo\r\r")
-        widget.wait_for(lambda: "Tokyo" in widget.text().splitlines()[0])
+        widget.wait_for(lambda: widget.query() == "Tokyo")
         self.assertEqual(sum(command[:2] == ["nordvpn", "connect"] for command in widget.commands()), 1)
         widget.send(b"\x03")
         self.assertEqual(widget.process.wait(timeout=3), 0)
@@ -301,6 +315,8 @@ class TerminalSmoke(unittest.TestCase):
         widget.send(b"r")
         widget.pump(0.5)
         self.assertEqual(sum(command[0] == "nordvpn" for command in widget.commands()), before)
+        self.assertIn("Status refreshed", widget.footer())
+        self.assertNotIn("Refreshing", widget.footer())
 
     def test_sigterm_restores_terminal(self):
         widget = self.widget()
@@ -350,6 +366,8 @@ class TerminalSmoke(unittest.TestCase):
         widget.wait_for(lambda: "Disconnected" in widget.text())
         self.assertEqual((widget.root / "service").read_text(), "active")
         self.assertNotIn("192.0.2.10", widget.text())
+        self.assertIn("Ready to connect", widget.text())
+        self.assertNotIn("Technology", widget.text())
         widget.send(b"s")
         widget.wait_for(lambda: "Service stopped" in widget.text())
         self.assertEqual((widget.root / "service").read_text(), "inactive")
@@ -364,12 +382,12 @@ class TerminalSmoke(unittest.TestCase):
             self.assertIn("Country", widget.text())
             self.assertIn("City", widget.text())
             widget.send(b"cdsrqi/")
-            widget.wait_for(lambda: "cdsrqi/" in widget.text().splitlines()[0])
+            widget.wait_for(lambda: widget.query() == "cdsrqi/")
             self.assertIsNone(widget.process.poll())
             self.assertEqual((widget.root / "service").read_text(), "inactive")
             self.assertFalse(any(command[0] in ("nordvpn", "sudo") for command in widget.commands()))
             widget.send(b"\x1b")
-            widget.wait_for(lambda: "Technology" in widget.text())
+            widget.wait_for(lambda: "VPN is off" in widget.text())
             self.assertFalse(widget.screen.cursor_visible)
         widget.send(b"q")
         self.assertEqual(widget.process.wait(timeout=3), 0)
@@ -398,6 +416,38 @@ class TerminalSmoke(unittest.TestCase):
         self.assertIn(["nordvpn", "connect"], commands)
         self.assertLess(commands.index(["systemctl", "start", "nordvpnd.service"]), commands.index(["nordvpn", "connect"]))
         self.assertNotIn("Search countries", widget.text())
+
+    def test_connected_hierarchy_and_footer_stay_cohesive_when_searching(self):
+        widget = self.widget(service="active", cached=True, vpn="Connected")
+        widget.wait_for(lambda: "Connected" in widget.footer())
+        lines = widget.text().splitlines()
+        city_row = next(index for index, line in enumerate(lines) if line.strip() == "New York")
+        self.assertEqual(lines[city_row + 1].strip(), "United States")
+        self.assertIn("192.0.2.10", widget.text())
+        self.assertIn("NORDLYNX", widget.text())
+        self.assertNotIn("Location", widget.text())
+        self.assertTrue(widget.footer().endswith("● Connected "))
+        self.assertNotIn("United States", widget.footer())
+        widget.send(b"/")
+        widget.wait_for(lambda: widget.query() == "Search countries and cities…")
+        self.assertTrue(widget.footer().endswith("● Connected "))
+        self.assertNotIn("192.0.2.10", widget.text())
+        widget.send(b"\x1b")
+        widget.wait_for(lambda: "Technology" in widget.text())
+        self.assertFalse(widget.screen.cursor_visible)
+
+    def test_narrow_footer_activity_preserves_status_and_child_cleanup(self):
+        widget = self.widget(service="active", cached=True, width=24, height=8, NORTUI_CONNECT_DELAY="10")
+        widget.wait_for(lambda: "Disconnected" in widget.footer())
+        widget.send(b"c")
+        widget.wait_for(lambda: (widget.root / "connect.pid").exists())
+        pid = int((widget.root / "connect.pid").read_text())
+        widget.wait_for(lambda: "…" in widget.footer())
+        self.assertTrue(widget.footer().endswith("● Disconnected "))
+        self.assertEqual(widget.footer().count("●"), 1)
+        widget.send(b"\x03")
+        self.assertEqual(widget.process.wait(timeout=3), 0)
+        self.assertFalse(Path(f"/proc/{pid}").exists())
 
 
 if __name__ == "__main__":

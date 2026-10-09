@@ -15,7 +15,7 @@ Or run from the checkout with `cargo run`.
 
 ## Use
 
-The widget opens on a panel showing the service state, location, VPN IP, and technology. Use these shortcuts from the panel:
+The widget opens on a connection view with a prominent city and secondary country, followed by VPN IP and technology. When stopped or disconnected, it shows a short contextual message. Service state and activity share the footer with connection status. Use these shortcuts from the panel:
 
 | Key | Action |
 | --- | --- |
@@ -44,7 +44,7 @@ When service control needs authentication, nortui temporarily restores the termi
 
 Status refreshes every two seconds. Countries and cities load progressively while the service runs and are cached at `$XDG_CACHE_HOME/nortui/locations.json` (normally `~/.cache/nortui/locations.json`). Cached locations remain searchable while the service is stopped. On a first launch with no cache, press **s** to start the service and load locations, or **c** to start and connect immediately. Refreshing does not start a stopped service. The service toggle waits for an observed state; if state is unavailable or changing, it reports that instead of guessing.
 
-The right-aligned gray footer reports connection state, with country/city and IP/technology added in search when space permits. Its circle is green when connected, red when disconnected, yellow when connecting or paused, and gray when the service is stopped. The panel hides connection details when disconnected or stopped. The interface uses Catppuccin Frappé with a transparent terminal background and a #232634 selection highlight. Commands run in the background; notices appear above the footer. A failed command preserves the interface and reports its error. NordVPN queries require access to its daemon, typically through membership in the `nordvpn` group. Unknown status output is shown as unavailable.
+The footer uses the same compact layout in the panel and location picker: service information or current activity on the left, gray connection status with one padding cell on the right. Its circle is green when connected, red when disconnected, yellow when connecting or paused, and gray when the service is stopped. The panel hides stale connection details and omits unavailable metadata. The interface uses Catppuccin Frappé with a transparent terminal background and a #232634 selection highlight, with matching margins in both views. Commands run in the background; progress and success notices appear in the footer. Errors get a separate red row above the separator when needed. A failed command preserves the interface and reports its error. NordVPN queries require access to its daemon, typically through membership in the `nordvpn` group. Unknown status output is shown as unavailable.
 
 ## Hyprland widget
 
@@ -64,7 +64,7 @@ hl.window_rule({
   dim_around = true,
   float = true,
   pin = true,
-  size = { 880, 500 },
+  size = { 880, 320 },
 })
 ```
 
