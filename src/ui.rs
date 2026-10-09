@@ -14,6 +14,9 @@ use crate::model::{ServiceState, VpnState, VpnStatus};
 const TEXT: Color = Color::Rgb(198, 208, 245);
 const GRAY: Color = Color::Rgb(131, 139, 167);
 const BLUE: Color = Color::Rgb(140, 170, 238);
+const TEAL: Color = Color::Rgb(129, 200, 190);
+const LAVENDER: Color = Color::Rgb(186, 187, 241);
+const PEACH: Color = Color::Rgb(239, 159, 118);
 const GREEN: Color = Color::Rgb(166, 209, 137);
 const RED: Color = Color::Rgb(231, 130, 132);
 const YELLOW: Color = Color::Rgb(229, 200, 144);
@@ -160,13 +163,13 @@ fn connection_lines(vpn: &VpnStatus, width: u16) -> Vec<Line<'static>> {
     };
     let session = vpn.state == VpnState::Connected && (vpn.uptime.is_some() || transfer.is_some());
     let metadata: Vec<_> = [
-        ("VPN IP", nonempty(vpn.ip.as_deref())),
-        ("Server", nonempty(vpn.server.as_deref())),
-        ("Technology", technology.as_deref()),
+        ("VPN IP", nonempty(vpn.ip.as_deref()), TEAL),
+        ("Server", nonempty(vpn.server.as_deref()), TEXT),
+        ("Technology", technology.as_deref(), LAVENDER),
     ]
     .into_iter()
-    .filter_map(|(label, value)| match value {
-        Some(value) => Some(metadata_line(label, value, width)),
+    .filter_map(|(label, value, color)| match value {
+        Some(value) => Some(metadata_line(label, value, width, color)),
         None if session => Some(Line::default()),
         None => None,
     })
@@ -178,11 +181,13 @@ fn connection_lines(vpn: &VpnStatus, width: u16) -> Vec<Line<'static>> {
     if session {
         lines.push(Line::default());
         lines.push(vpn.uptime.map_or_else(Line::default, |duration| {
-            metadata_line("Uptime", &format_uptime(duration), width)
+            metadata_line("Uptime", &format_uptime(duration), width, TEAL)
         }));
-        lines.push(transfer.as_deref().map_or_else(Line::default, |value| {
-            metadata_line("Transfer", value, width)
-        }));
+        lines.push(
+            transfer
+                .as_deref()
+                .map_or_else(Line::default, |value| transfer_line(value, width)),
+        );
     }
     lines
 }
@@ -259,14 +264,30 @@ fn wrapped_lines(text: &str, width: u16, color: Color) -> Vec<Line<'static>> {
     lines
 }
 
-fn metadata_line(label: &str, value: &str, width: u16) -> Line<'static> {
+fn metadata_line(label: &str, value: &str, width: u16, color: Color) -> Line<'static> {
     let label = format!("{label:<10}  ");
     let value_width =
         width.saturating_sub(u16::try_from(Line::from(label.as_str()).width()).unwrap_or(u16::MAX));
     Line::from(vec![
         Span::styled(label, Style::default().fg(GRAY)),
-        Span::styled(truncate(value, value_width), Style::default().fg(TEXT)),
+        Span::styled(truncate(value, value_width), Style::default().fg(color)),
     ])
+}
+
+fn transfer_line(value: &str, width: u16) -> Line<'static> {
+    let mut line = metadata_line("Transfer", value, width, TEXT);
+    if let Some(value) = line.spans.pop() {
+        line.spans
+            .extend(value.content.graphemes(true).map(|grapheme| {
+                let color = match grapheme {
+                    "↓" => TEAL,
+                    "↑" => PEACH,
+                    _ => TEXT,
+                };
+                Span::styled(grapheme.to_owned(), Style::default().fg(color))
+            }));
+    }
+    line
 }
 
 fn render_help(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -710,7 +731,7 @@ mod tests {
         assert_eq!(buffer[(2, hero_y + 1)].fg, GRAY);
         assert!(!buffer[(2, hero_y + 1)].modifier.contains(Modifier::BOLD));
         assert_eq!(buffer[(2, hero_y + 3)].fg, GRAY);
-        assert_eq!(buffer[(14, hero_y + 3)].fg, TEXT);
+        assert_eq!(buffer[(14, hero_y + 3)].fg, TEAL);
         assert!(!terminal.backend().cursor_visible());
         assert!(buffer.content().iter().all(|cell| cell.bg == Color::Reset));
         for unwanted in [
@@ -746,10 +767,13 @@ mod tests {
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(2, 1)].fg, BLUE);
         assert!(buffer[(2, 1)].modifier.contains(Modifier::BOLD));
-        for row in [4, 5, 6, 8, 9] {
+        for (row, color) in [(4, TEAL), (5, TEXT), (6, LAVENDER), (8, TEAL), (9, TEAL)] {
             assert_eq!(buffer[(2, row)].fg, GRAY);
-            assert_eq!(buffer[(14, row)].fg, TEXT);
+            assert_eq!(buffer[(14, row)].fg, color);
         }
+        assert_eq!(buffer[(28, 9)].fg, PEACH);
+        assert_eq!(buffer[(16, 9)].fg, TEXT);
+        assert_eq!(buffer[(30, 9)].fg, TEXT);
         assert!(buffer.content().iter().all(|cell| cell.bg == Color::Reset));
         assert!(row_text(&terminal, 10).starts_with('─'));
         assert!(row_text(&terminal, 11).ends_with("● Connected "));

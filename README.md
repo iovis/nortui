@@ -15,6 +15,8 @@ Or run from the checkout with `cargo run`.
 
 ## Use
 
+The connection panel uses steady Frappé accents: teal VPN IP and uptime, lavender technology/protocol, and teal **↓** / peach **↑** transfer arrows. Transfer amounts use the normal text color, with gray labels and a blue location heading.
+
 The widget opens on a connection view with a prominent city and secondary country, followed by VPN IP, server, and technology with protocol. Connected sessions also show compact uptime and cumulative transfer totals: **↓** received and **↑** sent, using the amounts and units reported by NordVPN. Uptime shows minutes and seconds below an hour, then hours, minutes, and seconds. Available statistics update in place; missing values stay blank, with space reserved for each session row, and the session section is omitted when no statistics are available. When stopped or disconnected, it shows a short contextual message. The panel keeps the last confirmed information during commands and intermediate status checks, then updates when a settled state is known. On launch, its body stays blank until the first confirmed reading. Progress appears only in the gray footer, and action progress begins after authentication preparation. Activity and recent results appear on the left; connection status stays on the right. Use these shortcuts from the panel:
 
 | Key | Action |
