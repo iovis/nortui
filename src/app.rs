@@ -607,6 +607,8 @@ struct Controller {
     backend: Backend,
     catalog: Catalog,
     cache_path: Option<PathBuf>,
+    cache_writer: Option<cache::Writer>,
+    cache_failed: bool,
     handle: Handle,
     sender: Sender<Message>,
     receiver: Receiver<Message>,
@@ -634,6 +636,7 @@ impl Controller {
                 )),
             ),
         };
+        let cache_failed = error.is_some();
         let mut app = App::new(catalog.locations());
         if let Some(error) = error {
             app.set_notice(error, true);
@@ -644,6 +647,8 @@ impl Controller {
             backend,
             catalog,
             cache_path,
+            cache_writer: None,
+            cache_failed,
             handle,
             sender,
             receiver,
@@ -694,6 +699,12 @@ impl Controller {
 
     fn tick(&mut self) {
         self.app.expire_notice();
+        while let Some(result) = self.cache_writer.as_mut().and_then(cache::Writer::poll) {
+            self.cache_failed = result.is_err();
+            if let Err(error) = result {
+                self.app.set_notice(error, true);
+            }
+        }
         if self.last_poll.elapsed() >= self.poll_interval()
             && self.status_job.as_ref().is_none_or(JoinHandle::is_finished)
         {
@@ -845,6 +856,7 @@ impl Controller {
         self.discovery_generation += 1;
         abort(&mut self.discovery_job);
         self.app.loading = None;
+        self.flush_cache();
     }
 
     fn apply_discovery(&mut self, run: u64, event: DiscoveryEvent) {
@@ -854,8 +866,8 @@ impl Controller {
         match event {
             DiscoveryEvent::Countries(countries) => {
                 self.app.loading = Some((0, countries.len()));
-                self.catalog.set_countries(&countries);
-                self.update_catalog();
+                let changed = self.catalog.set_countries(&countries);
+                self.update_catalog(changed);
             }
             DiscoveryEvent::Cities {
                 country,
@@ -865,13 +877,17 @@ impl Controller {
             } => {
                 self.app.loading = Some((finished, total));
                 if let Ok(cities) = result {
-                    self.catalog.set_cities(country, cities);
-                    self.update_catalog();
+                    let changed = self.catalog.set_cities(country, cities);
+                    self.update_catalog(changed);
                 }
             }
             DiscoveryEvent::Done(outcome) => {
                 self.discovery_job = None;
                 self.app.loading = None;
+                if self.cache_failed {
+                    self.persist_catalog();
+                }
+                self.flush_cache();
                 match outcome {
                     DiscoveryOutcome::Complete(Some(error)) => self.app.set_notice(error, true),
                     DiscoveryOutcome::Complete(None) => {}
@@ -930,12 +946,27 @@ impl Controller {
         self.app.set_snapshot(snapshot);
     }
 
-    fn update_catalog(&mut self) {
-        self.app.set_locations(self.catalog.locations());
-        if let Some(path) = &self.cache_path
-            && let Err(error) = self.catalog.save(path)
-        {
-            self.app.set_notice(format!("{error:#}"), true);
+    fn update_catalog(&mut self, changed: bool) {
+        if changed {
+            self.app.set_locations(self.catalog.locations());
+        }
+        if changed || self.cache_failed {
+            self.persist_catalog();
+        }
+    }
+
+    fn persist_catalog(&mut self) {
+        if let Some(path) = &self.cache_path {
+            let writer = self
+                .cache_writer
+                .get_or_insert_with(|| cache::Writer::new(path.clone(), &self.handle));
+            writer.submit(self.catalog.clone());
+        }
+    }
+
+    fn flush_cache(&self) {
+        if let Some(writer) = &self.cache_writer {
+            writer.flush();
         }
     }
 
@@ -955,6 +986,9 @@ impl Controller {
             let _ = job.await;
         }
         self.backend.reap_canceled().await;
+        if let Some(writer) = &mut self.cache_writer {
+            writer.shutdown().await;
+        }
     }
 }
 

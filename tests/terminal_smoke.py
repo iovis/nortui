@@ -107,7 +107,7 @@ elif name == "nordvpn":
             print("Servers by city are not available for this country.", file=sys.stderr)
             sys.exit(1)
         (root / f"city-{args[1]}.pid").write_text(str(os.getpid()))
-        time.sleep(float(os.environ.get("NORTUI_CITY_DELAY", "0")))
+        time.sleep(float(os.environ.get(f"NORTUI_{args[1].upper()}_CITY_DELAY", os.environ.get("NORTUI_CITY_DELAY", "0"))))
         print("New_York\nLos_Angeles" if args[1] == "United_States" else "Tokyo")
     elif args[0] == "connect":
         (root / "connect.pid").write_text(str(os.getpid()))
@@ -822,6 +822,23 @@ class TerminalSmoke(unittest.TestCase):
                     ["nordvpn", "cities", "Japan"],
                     ["nordvpn", "cities", "Monaco"],
                 ])
+
+    def test_quitting_discovery_flushes_latest_partial_catalog_and_reaps_children(self):
+        widget = self.widget(service="active", NORTUI_JAPAN_CITY_DELAY="10")
+        widget.wait_for(lambda: "Ready to connect" in widget.text())
+        widget.send(b"i")
+        worker = widget.root / "city-Japan.pid"
+        widget.wait_for(lambda: "Los Angeles / United States" in widget.text() and worker.exists())
+        pid = int(worker.read_text())
+        self.assertIn("Loading", widget.footer())
+        widget.send(b"\x03")
+        self.assertEqual(widget.process.wait(timeout=3), 0)
+        self.assertFalse(Path(f"/proc/{pid}").exists())
+        cache = json.loads((widget.root / "cache/nortui/locations.json").read_text())
+        self.assertEqual(cache["countries"]["United_States"], ["Los_Angeles", "New_York"])
+        self.assertEqual(cache["countries"]["Japan"], [])
+        self.assertIn("Monaco", cache["countries"])
+        self.assertEqual(termios.tcgetattr(widget.slave), widget.original_attributes)
 
     def test_completed_search_catalog_survives_reopening_restart_and_refresh(self):
         widget = self.widget(service="active")
