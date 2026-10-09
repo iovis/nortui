@@ -157,7 +157,9 @@ impl App {
 
     pub fn expire_notice(&mut self) {
         if self.notice.as_ref().is_some_and(|notice| {
-            !notice.is_error && notice.created.elapsed() > Duration::from_secs(8)
+            !notice.is_error
+                && notice.message != REFRESH_NOTICE
+                && notice.created.elapsed() > Duration::from_secs(3)
         }) {
             self.notice = None;
         }
