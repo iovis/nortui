@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::app::{App, Mode, SearchResult};
-use crate::model::{Action, ServiceState, VpnState, VpnStatus};
+use crate::model::{ServiceState, VpnState, VpnStatus};
 
 const TEXT: Color = Color::Rgb(198, 208, 245);
 const GRAY: Color = Color::Rgb(131, 139, 167);
@@ -37,7 +37,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let footer = Rect::new(area.x, area.bottom() - 1, area.width, 1);
     let body = body_area(content);
     match app.mode {
-        Mode::Panel => render_panel(frame, app, body),
+        Mode::Panel => {
+            let panel_body = body_area(Rect::new(area.x, area.y, area.width, area.height - 2));
+            render_panel(frame, app, panel_body, error_height);
+        }
         Mode::Search => render_search(frame, app, body),
         Mode::Help => render_help(frame, app, body),
     }
@@ -67,7 +70,7 @@ fn body_area(area: Rect) -> Rect {
     )
 }
 
-fn render_panel(frame: &mut Frame, app: &App, area: Rect) {
+fn render_panel(frame: &mut Frame, app: &App, area: Rect, error_height: u16) {
     let lines = panel_lines(app, area.width);
     let line_count = u16::try_from(lines.len()).unwrap_or(u16::MAX);
     let upper_space = (area.height.saturating_sub(line_count) / 2).min(3);
@@ -75,27 +78,16 @@ fn render_panel(frame: &mut Frame, app: &App, area: Rect) {
         area.x,
         area.y + upper_space,
         area.width,
-        area.height.saturating_sub(upper_space),
+        area.height.saturating_sub(upper_space + error_height),
     );
     frame.render_widget(Paragraph::new(lines), panel);
 }
 
 fn panel_lines(app: &App, width: u16) -> Vec<Line<'static>> {
-    if let Some(action) = app
-        .busy
-        .as_ref()
-        .filter(|action| **action != Action::Refresh)
-    {
-        let description = match action {
-            Action::Connect(_) | Action::Reconnect => "Finding a VPN server.",
-            Action::Disconnect => "Returning to your regular connection.",
-            Action::StartService => "Getting ready to connect.",
-            Action::StopService => "Closing the VPN connection.",
-            Action::Refresh => unreachable!(),
-        };
-        return message_lines(&action.label(), description, width);
-    }
-    match &app.snapshot.service {
+    let Some(snapshot) = app.panel_snapshot() else {
+        return Vec::new();
+    };
+    match &snapshot.service {
         ServiceState::Inactive => {
             let mut lines = message_lines("VPN is off", "Connect when you need it.", width);
             if app.locations.is_empty() {
@@ -108,33 +100,12 @@ fn panel_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             }
             lines
         }
-        ServiceState::Activating => {
-            message_lines("Starting service…", "Getting ready to connect.", width)
-        }
-        ServiceState::Deactivating => {
-            message_lines("Stopping service…", "Closing the VPN connection.", width)
-        }
         ServiceState::Failed => {
             message_lines("Service needs attention", "Try starting it again.", width)
         }
-        ServiceState::Unavailable(message) => {
-            if message == "Checking service…" {
-                message_lines(
-                    "Checking connection…",
-                    "Reading the current service state.",
-                    width,
-                )
-            } else {
-                message_lines("Service unavailable", "Refresh to check again.", width)
-            }
-        }
         ServiceState::Active => {
-            let Some(vpn) = &app.snapshot.vpn else {
-                return message_lines(
-                    "Checking connection…",
-                    "Reading the current VPN status.",
-                    width,
-                );
+            let Some(vpn) = &snapshot.vpn else {
+                return Vec::new();
             };
             match vpn.state {
                 VpnState::Connected | VpnState::Paused => connection_lines(vpn, width),
@@ -143,13 +114,11 @@ fn panel_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                     "Choose a location or connect to a recommended server.",
                     width,
                 ),
-                VpnState::Connecting => {
-                    message_lines("Connecting…", "Finding a VPN server.", width)
-                }
-                VpnState::Unavailable(_) => {
-                    message_lines("Connection unavailable", "Refresh to check again.", width)
-                }
+                VpnState::Connecting | VpnState::Unavailable(_) => Vec::new(),
             }
+        }
+        ServiceState::Activating | ServiceState::Deactivating | ServiceState::Unavailable(_) => {
+            Vec::new()
         }
     }
 }
@@ -452,8 +421,11 @@ fn spinner_frame() -> &'static str {
 }
 
 fn footer_activity(app: &App) -> (String, Color) {
-    if let Some(action) = &app.busy {
-        return (action.label(), YELLOW);
+    if app.is_initializing() {
+        return (String::new(), GRAY);
+    }
+    if let Some(action) = app.running_action() {
+        return (action.label(), GRAY);
     }
     if let Some((finished, total)) = app.loading {
         return (
@@ -464,6 +436,23 @@ fn footer_activity(app: &App) -> (String, Color) {
             },
             GRAY,
         );
+    }
+    let transition = match app.snapshot.service {
+        ServiceState::Activating => Some("Starting service…"),
+        ServiceState::Deactivating => Some("Stopping service…"),
+        ServiceState::Active
+            if app
+                .snapshot
+                .vpn
+                .as_ref()
+                .is_some_and(|vpn| vpn.state == VpnState::Connecting) =>
+        {
+            Some("Connecting…")
+        }
+        _ => None,
+    };
+    if let Some(transition) = transition {
+        return (transition.into(), GRAY);
     }
     if let Some(notice) = app.notice.as_ref().filter(|notice| !notice.is_error) {
         return (notice.message.clone(), GRAY);
@@ -570,10 +559,11 @@ fn status_color(app: &App) -> Color {
 mod tests {
     use super::*;
     use crate::app::ItemKind;
-    use crate::model::{Location, Snapshot, VpnStatus};
+    use crate::model::{Action, Location, Snapshot, VpnStatus};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Cell;
 
     fn terminal(app: &mut App, width: u16, height: u16) -> Terminal<TestBackend> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -602,6 +592,12 @@ mod tests {
             .map(|row| row_text(terminal, row))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn panel_cells(terminal: &Terminal<TestBackend>) -> Vec<Cell> {
+        let buffer = terminal.backend().buffer();
+        let count = usize::from(buffer.area.width) * usize::from(buffer.area.height - 3);
+        buffer.content()[..count].to_vec()
     }
 
     fn row_containing(terminal: &Terminal<TestBackend>, value: &str) -> u16 {
@@ -887,7 +883,11 @@ mod tests {
                 assert_eq!(buffer[(79, 11)].symbol(), " ");
                 assert_ne!(buffer[(78, 11)].symbol(), " ");
                 let footer = row_text(&terminal, 11);
-                if app.snapshot.service == ServiceState::Active {
+                if app.is_working() {
+                    assert!(SPINNER_FRAMES.contains(&buffer[(2, 11)].symbol()));
+                    assert_eq!(buffer[(2, 11)].fg, GRAY);
+                    assert!(footer.contains('…'));
+                } else if app.snapshot.service == ServiceState::Active {
                     assert!(footer.starts_with("  Service running"));
                 } else {
                     assert!(footer[..usize::from(circle_x)].trim().is_empty());
@@ -921,7 +921,7 @@ mod tests {
                 .map(|x| buffer[(x, 11)].symbol())
                 .collect::<String>();
             assert!(SPINNER_FRAMES.contains(&buffer[(2, 11)].symbol()));
-            assert_eq!(buffer[(2, 11)].fg, YELLOW);
+            assert_eq!(buffer[(2, 11)].fg, GRAY);
             assert!(left[buffer[(2, 11)].symbol().len()..].starts_with(" Conn"));
             if width < 80 {
                 assert!(left.trim_end().ends_with('…'));
@@ -980,6 +980,7 @@ mod tests {
         app.busy = Some(Action::Refresh);
         app.set_notice("Cannot read the connection\nPlease retry", true);
         let error = terminal(&mut app, 80, 12);
+        assert_eq!(panel_cells(&error), panel_cells(&normal));
         assert_eq!(
             row_text(&error, 9).trim_end(),
             "  Cannot read the connection Please retry"
@@ -998,19 +999,166 @@ mod tests {
     }
 
     #[test]
-    fn pending_location_is_identified_as_connecting_without_old_connection_metadata() {
+    fn connecting_and_disconnecting_keep_confirmed_body_until_a_final_status_read() {
         let mut app = App::new(Vec::new());
         app.set_snapshot(connected());
+        let mut terminal = terminal(&mut app, 80, 12);
+        let initial = panel_cells(&terminal);
         app.busy = Some(Action::Connect(Some(Location {
             country: "Japan".into(),
             city: Some("Tokyo".into()),
         })));
-        let terminal = terminal(&mut app, 80, 12);
-        assert!(text(&terminal).contains("Connecting to Tokyo / Japan…"));
-        assert!(text(&terminal).contains("Finding a VPN server."));
-        for stale in ["New York", "United States", "192.0.2.100", "NORDLYNX"] {
-            assert!(!text(&terminal).contains(stale));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(panel_cells(&terminal), initial);
+        assert!(row_text(&terminal, 11).contains("Connecting to Tokyo / Japan…"));
+        assert_eq!(terminal.backend().buffer()[(4, 11)].fg, GRAY);
+
+        let mut intermediate = connected();
+        intermediate.vpn.as_mut().unwrap().state = VpnState::Connecting;
+        app.set_snapshot(intermediate);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(panel_cells(&terminal), initial);
+        assert!(row_text(&terminal, 11).ends_with("● Connecting… "));
+
+        let mut tokyo = connected();
+        let vpn = tokyo.vpn.as_mut().unwrap();
+        vpn.city = Some("Tokyo".into());
+        vpn.country = Some("Japan".into());
+        vpn.ip = Some("192.0.2.200".into());
+        app.set_snapshot(tokyo.clone());
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(panel_cells(&terminal), initial);
+        app.busy = None;
+        app.set_notice("Connected", false);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(panel_cells(&terminal), initial);
+        app.set_snapshot(tokyo.clone());
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(text(&terminal).contains("Tokyo"));
+        assert!(text(&terminal).contains("Japan"));
+        assert!(text(&terminal).contains("192.0.2.200"));
+        assert!(!text(&terminal).contains("New York"));
+        let tokyo_body = panel_cells(&terminal);
+
+        app.busy = Some(Action::Disconnect);
+        tokyo.vpn.as_mut().unwrap().state = VpnState::Disconnected;
+        app.set_snapshot(tokyo.clone());
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(panel_cells(&terminal), tokyo_body);
+        assert!(row_text(&terminal, 11).contains("Disconnecting…"));
+        app.busy = None;
+        app.set_notice("Disconnected", false);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(panel_cells(&terminal), tokyo_body);
+        app.set_snapshot(tokyo);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(text(&terminal).contains("Ready to connect"));
+        for old in ["Tokyo", "Japan", "192.0.2.200", "VPN IP", "Technology"] {
+            assert!(!text(&terminal).contains(old));
         }
+    }
+
+    #[test]
+    fn initial_panel_is_blank_and_uses_a_gray_footer_spinner_until_confirmed() {
+        let mut app = App::new(Vec::new());
+        let mut terminal = terminal(&mut app, 80, 12);
+        for row in 0..10 {
+            assert!(row_text(&terminal, row).trim().is_empty());
+        }
+        assert!(SPINNER_FRAMES.contains(&terminal.backend().buffer()[(2, 11)].symbol()));
+        assert_eq!(terminal.backend().buffer()[(2, 11)].fg, GRAY);
+        assert!(row_text(&terminal, 11).ends_with("● Checking… "));
+        let circle = row_text(&terminal, 11).find('●').unwrap();
+        let activity = row_text(&terminal, 11)[..circle].trim().to_owned();
+        assert!(SPINNER_FRAMES.contains(&activity.as_str()));
+
+        app.set_snapshot(Snapshot {
+            service: ServiceState::Activating,
+            vpn: None,
+        });
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        for row in 0..10 {
+            assert!(row_text(&terminal, row).trim().is_empty());
+        }
+        assert!(row_text(&terminal, 11).contains("Starting service…"));
+        assert_eq!(terminal.backend().buffer()[(4, 11)].fg, GRAY);
+        app.set_snapshot(Snapshot {
+            service: ServiceState::Inactive,
+            vpn: None,
+        });
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(text(&terminal).contains("VPN is off"));
+        assert!(row_text(&terminal, 11).ends_with("● Service stopped "));
+        assert!(row_text(&terminal, 11).starts_with("  "));
+        assert!(!SPINNER_FRAMES.contains(&terminal.backend().buffer()[(2, 11)].symbol()));
+    }
+
+    #[test]
+    fn service_actions_and_failed_observations_leave_confirmed_panel_in_place() {
+        let mut app = App::new(vec![country()]);
+        app.set_snapshot(Snapshot {
+            service: ServiceState::Inactive,
+            vpn: None,
+        });
+        let mut terminal = terminal(&mut app, 80, 12);
+        let off_body = panel_cells(&terminal);
+        app.busy = Some(Action::StartService);
+        app.set_snapshot(Snapshot {
+            service: ServiceState::Activating,
+            vpn: None,
+        });
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(panel_cells(&terminal), off_body);
+        assert!(row_text(&terminal, 11).contains("Starting service…"));
+        app.busy = None;
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(panel_cells(&terminal), off_body);
+        let mut ready = connected();
+        ready.vpn.as_mut().unwrap().state = VpnState::Disconnected;
+        app.set_snapshot(ready);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(text(&terminal).contains("Ready to connect"));
+        let ready_body = panel_cells(&terminal);
+
+        for snapshot in [
+            Snapshot {
+                service: ServiceState::Unavailable("Read failed".into()),
+                vpn: None,
+            },
+            Snapshot {
+                service: ServiceState::Active,
+                vpn: None,
+            },
+            Snapshot {
+                service: ServiceState::Active,
+                vpn: Some(VpnStatus::unavailable("Read failed")),
+            },
+        ] {
+            app.set_snapshot(snapshot);
+            app.set_notice("Could not read status", true);
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            assert_eq!(panel_cells(&terminal), ready_body);
+            assert!(row_text(&terminal, 9).contains("Could not read status"));
+            assert_eq!(terminal.backend().buffer()[(2, 9)].fg, RED);
+        }
+        app.notice = None;
+        app.busy = Some(Action::StopService);
+        app.set_snapshot(Snapshot {
+            service: ServiceState::Deactivating,
+            vpn: None,
+        });
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(panel_cells(&terminal), ready_body);
+        assert!(row_text(&terminal, 11).contains("Stopping service…"));
+        app.busy = None;
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(panel_cells(&terminal), ready_body);
+        app.set_snapshot(Snapshot {
+            service: ServiceState::Inactive,
+            vpn: None,
+        });
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(panel_cells(&terminal), off_body);
     }
 
     #[test]

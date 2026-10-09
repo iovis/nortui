@@ -31,8 +31,13 @@ os.write(fd, (json.dumps([name, *args]) + "\n").encode())
 os.close(fd)
 if name == "systemctl":
     if args[0] == "show":
+        delay = root / "status-delay"
+        time.sleep(float(delay.read_text() if delay.exists() else os.environ.get("NORTUI_STATUS_DELAY", "0")))
         print((root / "service").read_text())
     elif args[0] in ("start", "stop"):
+        if os.environ.get("NORTUI_TRANSITIONS"):
+            (root / "service").write_text("activating" if args[0] == "start" else "deactivating")
+        time.sleep(float(os.environ.get("NORTUI_SERVICE_DELAY", "0")))
         (root / "service").write_text("active" if args[0] == "start" else "inactive")
         if args[0] == "stop":
             (root / "vpn").write_text("Disconnected")
@@ -40,6 +45,7 @@ if name == "systemctl":
         sys.exit(2)
 elif name == "sudo":
     if args == ["-n", "-v"]:
+        time.sleep(float(os.environ.get("NORTUI_CREDENTIAL_DELAY", "0")))
         sys.exit(0 if (root / "credentials").exists() else 1)
     if args == ["-v"]:
         flags = termios.tcgetattr(0)[3]
@@ -56,10 +62,14 @@ elif name == "sudo":
 elif name == "nordvpn":
     assert (root / "service").read_text() == "active", "queried a stopped daemon"
     if args[0] == "status":
+        if (root / "status-failure").exists():
+            print("Temporary VPN status failure", file=sys.stderr)
+            sys.exit(1)
         state = (root / "vpn").read_text()
         print("Status: " + state)
         if state == "Connected":
-            print("Country: United States\nCity: New York\nIP: 192.0.2.10\nCurrent technology: NORDLYNX")
+            city = (root / "vpn-city").read_text() if (root / "vpn-city").exists() else "New York"
+            print(f"Country: United States\nCity: {city}\nIP: 192.0.2.10\nCurrent technology: NORDLYNX")
     elif args[0] == "countries":
         print("United_States\nJapan\nMonaco")
     elif args[0] == "cities":
@@ -71,11 +81,16 @@ elif name == "nordvpn":
         print("New_York\nLos_Angeles" if args[1] == "United_States" else "Tokyo")
     elif args[0] == "connect":
         (root / "connect.pid").write_text(str(os.getpid()))
+        if os.environ.get("NORTUI_TRANSITIONS"):
+            (root / "vpn").write_text("Connecting")
         time.sleep(float(os.environ.get("NORTUI_CONNECT_DELAY", "0.1")))
+        if (root / "next-city").exists():
+            (root / "vpn-city").write_text((root / "next-city").read_text())
         (root / "vpn").write_text("Connected")
         print("You are connected to NordVPN.")
     elif args[0] == "disconnect":
         (root / "vpn").write_text("Disconnected")
+        time.sleep(float(os.environ.get("NORTUI_DISCONNECT_DELAY", "0")))
         print("You are disconnected.")
     else:
         sys.exit(2)
@@ -219,6 +234,9 @@ class Widget:
     def footer(self):
         return self.text().splitlines()[-1]
 
+    def body(self):
+        return self.text().splitlines()[:-2]
+
     def send(self, data):
         os.write(self.master, data)
 
@@ -255,6 +273,114 @@ class TerminalSmoke(unittest.TestCase):
         widget = Widget(**kwargs)
         self.addCleanup(widget.close)
         return widget
+
+    def test_initial_status_check_uses_only_footer_progress(self):
+        widget = self.widget(cached=True, NORTUI_STATUS_DELAY="0.6")
+        widget.wait_for(lambda: widget.screen.alternate_active and bool(widget.commands()))
+        self.assertTrue(all(not row.strip() for row in widget.body()))
+        self.assertIn(widget.footer().lstrip()[0], SPINNER_FRAMES)
+        self.assertTrue(widget.footer().endswith("● Checking… "))
+        widget.wait_for(lambda: widget.footer().endswith("● Service stopped "))
+        self.assertIn("VPN is off", widget.text())
+        self.assertNotIn(b"Checking connection", widget.raw)
+        self.assertFalse(any(frame in widget.footer() for frame in SPINNER_FRAMES))
+
+    def test_authentication_preparation_does_not_change_panel_or_footer(self):
+        widget = self.widget(cached=True, NORTUI_CREDENTIAL_DELAY="0.5", NORTUI_CONNECT_DELAY="0.5")
+        widget.wait_for(lambda: widget.footer().endswith("● Service stopped "))
+        body, footer = widget.body(), widget.footer()
+        widget.send(b"c")
+        widget.wait_for(lambda: ["sudo", "-n", "-v"] in widget.commands())
+        widget.pump(0.15)
+        self.assertEqual(widget.body(), body)
+        self.assertEqual(widget.footer(), footer)
+        widget.wait_for(lambda: b"AUTH_COOKED" in widget.raw)
+        before_prompt = widget.raw.split(b"AUTH_COOKED")[0]
+        self.assertNotIn(b"Connecting to", before_prompt)
+        self.assertNotIn(b"Starting service", before_prompt)
+        self.assertNotIn(b"38;2;229;200;144", before_prompt)
+        widget.send(b"password\n")
+        widget.wait_for(lambda: (widget.root / "connect.pid").exists() and "Connecting to" in widget.footer())
+        self.assertEqual(widget.body(), body)
+        self.assertIn(widget.footer().lstrip()[0], SPINNER_FRAMES)
+        widget.wait_for(lambda: widget.footer().endswith("● Connected "))
+        self.assertIn("New York", widget.text())
+        self.assertNotIn("VPN is off", widget.text())
+
+    def test_service_actions_keep_body_until_final_status_is_known(self):
+        widget = self.widget(cached=True, NORTUI_SERVICE_DELAY="0.35", NORTUI_TRANSITIONS="1")
+        (widget.root / "credentials").touch()
+        widget.wait_for(lambda: widget.footer().endswith("● Service stopped "))
+        (widget.root / "status-delay").write_text("0.4")
+        for final_state, activity, completion, headline in [
+            ("Disconnected", "Starting service…", "Service started", "Ready to connect"),
+            ("Service stopped", "Stopping service…", "Service stopped", "VPN is off"),
+        ]:
+            body = widget.body()
+            widget.send(b"s")
+            widget.wait_for(lambda: activity in widget.footer())
+            self.assertEqual(widget.body(), body)
+            self.assertIn(widget.footer().lstrip()[0], SPINNER_FRAMES)
+            widget.wait_for(lambda: completion in widget.footer() and activity not in widget.footer())
+            self.assertEqual(widget.body(), body, "Command completion must wait for the resulting status reading")
+            widget.wait_for(lambda: widget.footer().endswith(f"● {final_state} "))
+            self.assertIn(headline, widget.text())
+            self.assertNotEqual(widget.body(), body)
+        self.assertEqual(widget.location_commands(), [])
+
+    def test_connection_actions_keep_confirmed_details_through_completion(self):
+        widget = self.widget(service="active", vpn="Connected", cached=True,
+                             NORTUI_CONNECT_DELAY="0.35", NORTUI_DISCONNECT_DELAY="0.35", NORTUI_TRANSITIONS="1")
+        widget.wait_for(lambda: "New York" in widget.text())
+        (widget.root / "status-delay").write_text("0.4")
+        for key, activity, completion, city, status, headline in [
+            (b"c", "Connecting to", "You are connected", "Los Angeles", "Connected", "Los Angeles"),
+            (b"d", "Disconnecting…", "You are disconnected", "", "Disconnected", "Ready to connect"),
+            (b"c", "Connecting to", "You are connected", "Chicago", "Connected", "Chicago"),
+        ]:
+            if city:
+                (widget.root / "next-city").write_text(city)
+            body = widget.body()
+            widget.send(key)
+            widget.wait_for(lambda: activity in widget.footer())
+            self.assertEqual(widget.body(), body)
+            widget.wait_for(lambda: completion in widget.footer() and activity not in widget.footer())
+            self.assertEqual(widget.body(), body, "Completed command must not restore or replace the confirmed body early")
+            widget.wait_for(lambda: widget.footer().endswith(f"● {status} ") and headline in widget.text())
+            self.assertNotEqual(widget.body(), body)
+            if key == b"d":
+                self.assertNotIn("192.0.2.10", widget.text())
+                self.assertNotIn("Technology", widget.text())
+        self.assertEqual(widget.location_commands(), [])
+
+    def test_external_transitions_and_read_failures_retain_confirmed_panel(self):
+        widget = self.widget(service="active", vpn="Connected", cached=True, width=80, height=14)
+        widget.wait_for(lambda: "New York" in widget.text())
+        body = widget.body()
+        for service, vpn, status in [
+            ("activating", "Connected", "Service starting…"),
+            ("deactivating", "Connected", "Service stopping…"),
+            ("active", "Connecting", "Connecting…"),
+        ]:
+            (widget.root / "service").write_text(service)
+            (widget.root / "vpn").write_text(vpn)
+            widget.send(b"r")
+            widget.wait_for(lambda: widget.footer().endswith(f"● {status} "))
+            self.assertEqual(widget.body(), body)
+            self.assertIn(widget.footer().lstrip()[0], SPINNER_FRAMES)
+        (widget.root / "status-failure").touch()
+        widget.send(b"r")
+        widget.wait_for(lambda: "Temporary VPN status failure" in widget.text())
+        self.assertTrue(widget.footer().endswith("● VPN unavailable "))
+        self.assertEqual(widget.body()[:-1], body[:-1], "The error row must not move the confirmed panel")
+        (widget.root / "status-failure").unlink()
+        (widget.root / "service").write_text("inactive")
+        widget.send(b"r")
+        widget.wait_for(lambda: widget.footer().endswith("● Service stopped "))
+        self.assertIn("VPN is off", widget.text())
+        self.assertNotIn("New York", widget.text())
+        self.assertNotIn("192.0.2.10", widget.text())
+        self.assertNotIn("Technology", widget.text())
 
     def test_shortcut_help_is_dismissible_and_does_not_execute_actions_or_load_locations(self):
         widget = self.widget(service="active", cached=True)

@@ -80,6 +80,9 @@ pub struct App {
     pub notice: Option<Notice>,
     pub busy: Option<Action>,
     pub loading: Option<(usize, usize)>,
+    panel_snapshot: Option<Snapshot>,
+    initializing: bool,
+    action_preparing: bool,
     query_cursor: usize,
     matcher: Matcher,
 }
@@ -98,6 +101,9 @@ impl App {
             notice: None,
             busy: None,
             loading: None,
+            panel_snapshot: None,
+            initializing: true,
+            action_preparing: false,
             query_cursor: 0,
             matcher: Matcher::new(Config::DEFAULT),
         };
@@ -106,8 +112,34 @@ impl App {
     }
 
     pub fn set_snapshot(&mut self, snapshot: Snapshot) {
+        let settled = match snapshot.service {
+            ServiceState::Inactive | ServiceState::Failed => true,
+            ServiceState::Active => snapshot.vpn.as_ref().is_some_and(|vpn| {
+                matches!(
+                    vpn.state,
+                    VpnState::Connected | VpnState::Disconnected | VpnState::Paused
+                )
+            }),
+            _ => false,
+        };
+        if self.busy.is_none() && settled {
+            self.panel_snapshot = Some(snapshot.clone());
+        }
+        self.initializing = false;
         self.snapshot = snapshot;
         self.rebuild(true);
+    }
+
+    pub fn panel_snapshot(&self) -> Option<&Snapshot> {
+        self.panel_snapshot.as_ref()
+    }
+
+    pub fn is_initializing(&self) -> bool {
+        self.initializing
+    }
+
+    pub fn running_action(&self) -> Option<&Action> {
+        self.busy.as_ref().filter(|_| !self.action_preparing)
     }
 
     pub fn set_locations(&mut self, locations: Vec<Location>) {
@@ -132,8 +164,19 @@ impl App {
     }
 
     pub fn is_working(&self) -> bool {
-        self.busy.is_some()
+        self.is_initializing()
+            || self.running_action().is_some()
             || self.loading.is_some()
+            || matches!(
+                self.snapshot.service,
+                ServiceState::Activating | ServiceState::Deactivating
+            )
+            || (self.snapshot.service == ServiceState::Active
+                && self
+                    .snapshot
+                    .vpn
+                    .as_ref()
+                    .is_some_and(|vpn| vpn.state == VpnState::Connecting))
             || self
                 .notice
                 .as_ref()
@@ -406,6 +449,9 @@ impl App {
     }
 
     pub fn status_text(&self) -> String {
+        if self.is_initializing() {
+            return "Checking…".into();
+        }
         match &self.snapshot.service {
             ServiceState::Inactive => "Service stopped".into(),
             ServiceState::Activating => "Service starting…".into(),
@@ -650,7 +696,7 @@ impl Controller {
             return;
         }
         self.app.busy = Some(action.clone());
-        self.app.set_notice(action.label(), false);
+        self.app.action_preparing = true;
         let backend = self.backend.clone();
         let sender = self.sender.clone();
         let generation = self.generation;
@@ -673,6 +719,8 @@ impl Controller {
     }
 
     fn start_action(&mut self, action: Action) {
+        self.app.action_preparing = false;
+        self.app.set_notice(action.label(), false);
         let backend = self.backend.clone();
         let sender = self.sender.clone();
         let generation = self.generation;
@@ -691,6 +739,7 @@ impl Controller {
     fn finish_action(&mut self, result: std::result::Result<String, String>) {
         self.generation += 1;
         self.app.busy = None;
+        self.app.action_preparing = false;
         self.action_job = None;
         match result {
             Ok(message) => self.app.set_notice(message, false),
@@ -1480,6 +1529,104 @@ mod tests {
         app.paste("no-such-location");
         assert!(app.results.is_empty());
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Input::None);
+    }
+
+    #[test]
+    fn panel_retains_confirmed_state_through_work_and_incomplete_observations() {
+        let mut app = App::new(Vec::new());
+        assert!(app.is_initializing());
+        assert!(app.is_working());
+        assert!(app.panel_snapshot().is_none());
+        let ready = Snapshot {
+            service: ServiceState::Active,
+            vpn: Some(crate::model::VpnStatus {
+                state: VpnState::Disconnected,
+                country: None,
+                city: None,
+                ip: None,
+                technology: None,
+            }),
+        };
+        app.set_snapshot(ready.clone());
+        assert!(!app.is_initializing());
+        assert!(!app.is_working());
+        app.busy = Some(Action::Connect(None));
+        let mut connected = ready.clone();
+        let vpn = connected.vpn.as_mut().unwrap();
+        vpn.state = VpnState::Connected;
+        vpn.city = Some("Tokyo".into());
+        app.set_snapshot(connected.clone());
+        assert_eq!(app.snapshot, connected);
+        assert_eq!(app.panel_snapshot(), Some(&ready));
+        app.busy = None;
+        assert_eq!(app.panel_snapshot(), Some(&ready));
+        app.set_snapshot(connected.clone());
+        assert_eq!(app.panel_snapshot(), Some(&connected));
+
+        let mut connecting = connected.clone();
+        connecting.vpn.as_mut().unwrap().state = VpnState::Connecting;
+        for incomplete in [
+            connecting,
+            Snapshot {
+                service: ServiceState::Activating,
+                vpn: None,
+            },
+            Snapshot {
+                service: ServiceState::Deactivating,
+                vpn: None,
+            },
+            Snapshot {
+                service: ServiceState::Active,
+                vpn: None,
+            },
+            Snapshot {
+                service: ServiceState::Active,
+                vpn: Some(crate::model::VpnStatus::unavailable(
+                    "Temporary read failure",
+                )),
+            },
+            Snapshot {
+                service: ServiceState::Unavailable("Temporary read failure".into()),
+                vpn: None,
+            },
+        ] {
+            app.set_snapshot(incomplete.clone());
+            assert_eq!(app.snapshot, incomplete);
+            assert_eq!(app.panel_snapshot(), Some(&connected));
+        }
+        app.set_snapshot(ready.clone());
+        assert_eq!(app.panel_snapshot(), Some(&ready));
+        let off = Snapshot {
+            service: ServiceState::Inactive,
+            vpn: None,
+        };
+        app.set_snapshot(off.clone());
+        assert_eq!(app.panel_snapshot(), Some(&off));
+    }
+
+    #[test]
+    fn action_preparation_blocks_duplicates_without_visible_action_progress() {
+        let runtime = Runtime::new().unwrap();
+        let mut controller = Controller::new(Backend::new(), runtime.handle().clone());
+        controller.app.set_snapshot(Snapshot {
+            service: ServiceState::Inactive,
+            vpn: None,
+        });
+        controller.app.set_notice("Previous status", false);
+        controller.app.busy = Some(Action::StartService);
+        controller.app.action_preparing = true;
+        assert!(controller.app.running_action().is_none());
+        assert!(!controller.app.is_working());
+        controller.execute(Action::StopService);
+        assert_eq!(controller.app.busy, Some(Action::StartService));
+        assert!(controller.action_job.is_none());
+        assert_eq!(
+            controller.app.notice.as_ref().unwrap().message,
+            "Previous status"
+        );
+        controller.app.action_preparing = false;
+        assert_eq!(controller.app.running_action(), Some(&Action::StartService));
+        assert!(controller.app.is_working());
     }
 
     #[test]

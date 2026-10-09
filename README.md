@@ -15,7 +15,7 @@ Or run from the checkout with `cargo run`.
 
 ## Use
 
-The widget opens on a connection view with a prominent city and secondary country, followed by VPN IP and technology. When stopped or disconnected, it shows a short contextual message. Service state and activity share the footer with connection status. Use these shortcuts from the panel:
+The widget opens on a connection view with a prominent city and secondary country, followed by VPN IP and technology. When stopped or disconnected, it shows a short contextual message. The panel keeps the last confirmed information during commands and intermediate status checks, then updates when a settled state is known. On launch, its body stays blank until the first confirmed reading. Progress appears only in the gray footer, and action progress begins after authentication preparation. Service state and activity share the footer with connection status. Use these shortcuts from the panel:
 
 | Key | Action |
 | --- | --- |
