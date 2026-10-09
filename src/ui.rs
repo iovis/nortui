@@ -1,3 +1,6 @@
+use std::sync::OnceLock;
+use std::time::Instant;
+
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -16,6 +19,7 @@ const RED: Color = Color::Rgb(231, 130, 132);
 const YELLOW: Color = Color::Rgb(229, 200, 144);
 const SELECTED_BACKGROUND: Color = Color::Rgb(35, 38, 52);
 const INSET: u16 = 2;
+const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
@@ -335,6 +339,11 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let left_width = status_area.x.saturating_sub(area.x + INSET + 2);
     let (activity, color) = footer_activity(app);
     if left_width > 0 {
+        let activity = if app.is_working() {
+            format!("{} {activity}", spinner_frame())
+        } else {
+            activity
+        };
         frame.render_widget(
             Paragraph::new(truncate(&activity, left_width)).style(Style::default().fg(color)),
             Rect::new(area.x + INSET, area.y, left_width, 1),
@@ -347,6 +356,13 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         ])),
         status_area,
     );
+}
+
+fn spinner_frame() -> &'static str {
+    static STARTED: OnceLock<Instant> = OnceLock::new();
+    let elapsed = STARTED.get_or_init(Instant::now).elapsed();
+    let index = (elapsed.as_millis() / 60) % (SPINNER_FRAMES.len() as u128);
+    SPINNER_FRAMES[usize::try_from(index).unwrap_or(0)]
 }
 
 fn footer_activity(app: &App) -> (String, Color) {
@@ -786,7 +802,9 @@ mod tests {
             let left = (2..circle_x - 2)
                 .map(|x| buffer[(x, 11)].symbol())
                 .collect::<String>();
-            assert!(left.starts_with("Connect"));
+            assert!(SPINNER_FRAMES.contains(&buffer[(2, 11)].symbol()));
+            assert_eq!(buffer[(2, 11)].fg, YELLOW);
+            assert!(left[buffer[(2, 11)].symbol().len()..].starts_with(" Conn"));
             if width < 80 {
                 assert!(left.trim_end().ends_with('…'));
             }
@@ -796,13 +814,17 @@ mod tests {
         assert!(!row_text(&wide, 11).contains("Loading"));
         assert!(!row_text(&wide, 11).contains("Refreshed"));
         app.busy = None;
+        let loading = terminal(&mut app, 80, 12);
+        assert!(SPINNER_FRAMES.contains(&loading.backend().buffer()[(2, 11)].symbol()));
+        assert_eq!(loading.backend().buffer()[(2, 11)].fg, GRAY);
         assert!(
             row_text(&terminal(&mut app, 80, 12), 11).contains("Loading cities · 3/50 countries")
         );
         app.loading = Some((0, 0));
         assert!(row_text(&terminal(&mut app, 80, 12), 11).contains("Loading countries…"));
         app.loading = None;
-        assert!(row_text(&terminal(&mut app, 80, 12), 11).contains("Refreshed"));
+        let complete = terminal(&mut app, 80, 12);
+        assert!(row_text(&complete, 11).starts_with("  Refreshed"));
         app.set_notice("接続が完了しました 接続が完了しました", false);
         let narrow = terminal(&mut app, 32, 12);
         assert!(row_text(&narrow, 11).contains('接'));

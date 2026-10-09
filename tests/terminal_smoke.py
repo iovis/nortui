@@ -19,6 +19,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 BINARY = Path(os.environ.get("NORTUI_TEST_BINARY", ROOT / "target/debug/nortui"))
+SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 FAKE = r'''#!/usr/bin/python3
 import json, os, sys, termios, time
 from pathlib import Path
@@ -296,6 +297,7 @@ class TerminalSmoke(unittest.TestCase):
         widget.wait_for(lambda: (widget.root / "connect.pid").exists())
         pid = int((widget.root / "connect.pid").read_text())
         widget.wait_for(lambda: "Connecting" in widget.footer())
+        self.assertIn(widget.footer().lstrip()[0], SPINNER_FRAMES)
         widget.send(b"cc/Tokyo\r\r")
         widget.wait_for(lambda: widget.query() == "Tokyo")
         self.assertEqual(sum(command[:2] == ["nordvpn", "connect"] for command in widget.commands()), 1)
@@ -317,6 +319,26 @@ class TerminalSmoke(unittest.TestCase):
         self.assertEqual(sum(command[0] == "nordvpn" for command in widget.commands()), before)
         self.assertIn("Status refreshed", widget.footer())
         self.assertNotIn("Refreshing", widget.footer())
+        self.assertFalse(any(frame in widget.footer() for frame in SPINNER_FRAMES))
+
+    def test_city_loading_spinner_animates_while_searching_and_disappears_when_done(self):
+        widget = self.widget(service="active", cached=True, NORTUI_CITY_DELAY="1")
+        widget.wait_for(lambda: "Loading cities" in widget.footer())
+        first = widget.footer().lstrip()[0]
+        self.assertIn(first, SPINNER_FRAMES)
+        self.assertIn("/3 countries", widget.footer())
+        self.assertTrue(widget.footer().endswith("● Disconnected "))
+
+        widget.send(b"/new")
+        widget.wait_for(lambda: widget.query() == "new")
+        widget.wait_for(lambda: widget.footer().lstrip()[0] != first, timeout=0.5)
+        self.assertIn(widget.footer().lstrip()[0], SPINNER_FRAMES)
+        self.assertIn("Loading cities", widget.footer())
+
+        widget.wait_for(lambda: "Service running" in widget.footer())
+        self.assertFalse(any(frame in widget.footer() for frame in SPINNER_FRAMES))
+        self.assertEqual(widget.query(), "new")
+        self.assertTrue(widget.footer().endswith("● Disconnected "))
 
     def test_sigterm_restores_terminal(self):
         widget = self.widget()

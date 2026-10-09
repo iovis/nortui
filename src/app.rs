@@ -123,6 +123,15 @@ impl App {
         }
     }
 
+    pub fn is_working(&self) -> bool {
+        self.busy.is_some()
+            || self.loading.is_some()
+            || self
+                .notice
+                .as_ref()
+                .is_some_and(|notice| !notice.is_error && notice.message == REFRESH_NOTICE)
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Input {
         if key.kind == KeyEventKind::Release
             || key
@@ -1269,6 +1278,7 @@ mod tests {
         let runtime = Runtime::new().unwrap();
         let mut controller = Controller::new(Backend::new(), runtime.handle().clone());
         controller.app.set_notice(REFRESH_NOTICE, false);
+        assert!(controller.app.is_working());
         controller.apply_status(Ok(Snapshot {
             service: ServiceState::Inactive,
             vpn: None,
@@ -1277,10 +1287,12 @@ mod tests {
             controller.app.notice.as_ref().unwrap().message,
             "Status refreshed"
         );
+        assert!(!controller.app.is_working());
         controller.app.set_notice(REFRESH_NOTICE, false);
         controller.apply_status(Err("Cannot query systemd".into()));
         let notice = controller.app.notice.as_ref().unwrap();
         assert!(notice.is_error);
         assert_eq!(notice.message, "Cannot query systemd");
+        assert!(!controller.app.is_working());
     }
 }
