@@ -90,6 +90,10 @@ class Screen:
         self.rows = [[" "] * width for _ in range(height)]
         self.pending = ""
         self.cursor_visible = False
+        self.alternate_active = False
+        self.primary_rows = self.rows
+        self.primary_cursor = (0, 0)
+        self.restored_screens = []
 
     def feed(self, text):
         self.pending += text
@@ -103,9 +107,18 @@ class Screen:
                 if parameters.startswith("?"):
                     if parameters == "?25":
                         self.cursor_visible = command == "h"
-                    if parameters == "?1049" and command == "h":
-                        self.rows = [[" "] * self.width for _ in range(self.height)]
-                        self.x = self.y = 0
+                    if parameters == "?1049":
+                        if command == "h" and not self.alternate_active:
+                            self.primary_rows = self.rows
+                            self.primary_cursor = (self.x, self.y)
+                            self.rows = [[" "] * self.width for _ in range(self.height)]
+                            self.x = self.y = 0
+                            self.alternate_active = True
+                        elif command == "l" and self.alternate_active:
+                            self.rows = self.primary_rows
+                            self.x, self.y = self.primary_cursor
+                            self.alternate_active = False
+                            self.restored_screens.append(self.text())
                     continue
                 values = [int(value or 0) for value in parameters.split(";")]
                 if command in "Hf":
@@ -289,6 +302,36 @@ class TerminalSmoke(unittest.TestCase):
                 self.assertFalse(termios.tcgetattr(widget.slave)[3] & termios.ICANON)
                 self.assertIn("VPN is off", widget.text())
                 self.assertFalse(widget.screen.cursor_visible)
+
+    def test_quitting_after_authentication_never_reveals_sudo_on_primary_screen(self):
+        for failure in ("0", "1", "130"):
+            with self.subTest(authentication_exit_code=failure):
+                widget = self.widget(cached=True, NORTUI_AUTH_FAILURE=failure)
+                widget.wait_for(lambda: "Service stopped" in widget.text())
+                # Model existing shell content so clearing the primary screen
+                # cannot pass merely by removing the saved sudo prompt.
+                shell = "Existing shell output"
+                widget.screen.primary_rows[0][:len(shell)] = list(shell)
+                original_primary = "\n".join("".join(row) for row in widget.screen.primary_rows)
+                widget.send(b"/new york\r")
+                widget.wait_for(lambda: "AUTH_COOKED" in widget.text())
+                self.assertTrue(termios.tcgetattr(widget.slave)[3] & termios.ICANON)
+                widget.send(b"password\n")
+                if failure == "0":
+                    widget.wait_for(lambda: "Connected" in widget.footer())
+                else:
+                    widget.wait_for(lambda: "Sudo authentication was canceled or failed" in widget.text())
+                self.assertFalse(termios.tcgetattr(widget.slave)[3] & termios.ICANON)
+                widget.send(b"q")
+                self.assertEqual(widget.process.wait(timeout=3), 0)
+                widget.pump()
+                self.assertFalse(widget.screen.alternate_active)
+                self.assertTrue(widget.screen.restored_screens)
+                for restored in widget.screen.restored_screens:
+                    self.assertEqual(restored, original_primary)
+                    self.assertNotIn("AUTH_COOKED", restored)
+                self.assertEqual(widget.text(), original_primary)
+                self.assertEqual(termios.tcgetattr(widget.slave)[3], widget.original_flags)
 
     def test_slow_connection_keeps_search_responsive_and_exit_reaps_child(self):
         widget = self.widget(service="active", cached=True, NORTUI_CONNECT_DELAY="10")

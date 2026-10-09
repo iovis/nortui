@@ -5,12 +5,15 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use crossterm::cursor::MoveTo;
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event as InputEvent, KeyCode, KeyEvent,
     KeyEventKind, KeyModifiers,
 };
 use crossterm::execute;
-use crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, enable_raw_mode};
+use crossterm::terminal::{
+    Clear, ClearType, EnterAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ratatui::Terminal;
@@ -863,13 +866,22 @@ impl TerminalSession {
     fn suspend<T>(&mut self, operation: impl FnOnce() -> T) -> Result<T> {
         execute!(io::stdout(), DisableBracketedPaste)?;
         self.terminal.show_cursor()?;
-        ratatui::try_restore().context("Cannot restore terminal for authentication")?;
+        // Keep sudo in the alternate screen so its prompt cannot reappear in
+        // the saved shell screen when the widget closes.
+        disable_raw_mode().context("Cannot restore terminal input for authentication")?;
+        execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0))?;
         let result = operation();
-        self.terminal =
-            Self::initialize().context("Cannot restore terminal after authentication")?;
-        // Fullscreen reinitialization already resets Ratatui's buffers. Clear
-        // directly: Terminal::clear queries cursor position unnecessarily here.
-        execute!(io::stdout(), Clear(ClearType::All))?;
+        enable_raw_mode().context("Cannot restore terminal input after authentication")?;
+        execute!(
+            io::stdout(),
+            EnableBracketedPaste,
+            Clear(ClearType::All),
+            MoveTo(0, 0)
+        )?;
+        // Recreate Ratatui's buffers for a full redraw without switching screens
+        // or querying cursor position through Terminal::clear.
+        self.terminal = Terminal::new(CrosstermBackend::new(TerminalOutput(io::stdout())))
+            .context("Cannot restore terminal after authentication")?;
         Ok(result)
     }
 }
