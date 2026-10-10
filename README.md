@@ -106,7 +106,5 @@ cargo build
 python3 tests/terminal_smoke.py
 ```
 
-Tests use isolated fake NordVPN, systemctl, and sudo commands. The terminal
-smoke tests run the built application in a pseudo-terminal using Python's
-standard library. They require no VPN account, sudo privileges, or running
-NordVPN service.
+Tests do not require a VPN account, sudo privileges, or a running NordVPN
+service.
