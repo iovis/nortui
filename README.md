@@ -100,7 +100,7 @@ The cache is stored at `$XDG_CACHE_HOME/nortui/locations.json`, or
 ```sh
 cargo check
 cargo fmt --check
-cargo test -- --test-threads=1
+cargo test
 cargo clippy --all-targets -- -W clippy::pedantic -A clippy::missing-errors-doc -A clippy::missing-panics-doc -A clippy::must-use-candidate
 cargo build
 python3 tests/terminal_smoke.py

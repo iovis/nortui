@@ -656,7 +656,7 @@ pub fn strip_terminal_sequences(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use std::{fs, os::unix::fs::symlink};
 
     use tempfile::TempDir;
 
@@ -759,12 +759,21 @@ esac
 
     fn program(root: &Path, name: &str, body: &str) -> PathBuf {
         let path = root.join(name);
+        // Writing executables while other tests spawn can leave a writable
+        // descriptor in a forked child and make exec fail with ETXTBSY.
+        // Keep the executable fixed and write each command's body as data.
         fs::write(
-            &path,
-            format!("#!/bin/sh\nroot={}\n{body}", shell_quote(root)),
+            root.join(format!("{name}.script")),
+            format!("root={}\n{body}", shell_quote(root)),
         )
         .unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        if !path.exists() {
+            symlink(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/command.sh"),
+                &path,
+            )
+            .unwrap();
+        }
         path
     }
 
@@ -1224,22 +1233,33 @@ esac
             "printf '%s' \"$$\" > \"$root/pid\"\nexec sleep 30\n",
         );
         let backend = fixture.backend.clone();
-        let job = tokio::spawn(async move { backend.authenticate(std::future::pending()).await });
+        let mut job =
+            tokio::spawn(async move { backend.authenticate(std::future::pending()).await });
         let pid_file = fixture.directory.path().join("pid");
-        timeout(Duration::from_secs(2), async {
-            while !pid_file.exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+        let pid = timeout(Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    result = &mut job => {
+                        panic!("Authentication ended before writing its PID: {result:?}");
+                    }
+                    () = tokio::time::sleep(Duration::from_millis(10)) => {
+                        if let Ok(contents) = fs::read_to_string(&pid_file)
+                            && let Ok(pid) = contents.parse::<u32>()
+                        {
+                            break pid;
+                        }
+                    }
+                }
             }
         })
         .await
-        .unwrap();
-        let pid = fs::read_to_string(pid_file).unwrap();
+        .expect("Authentication did not write its PID within two seconds");
         job.abort();
         assert!(job.await.unwrap_err().is_cancelled());
         timeout(Duration::from_secs(2), fixture.backend.reap_canceled())
             .await
             .unwrap();
-        assert!(!Path::new("/proc").join(pid).exists());
+        assert!(!Path::new("/proc").join(pid.to_string()).exists());
         let error = fixture
             .backend
             .authenticate(std::future::pending())
