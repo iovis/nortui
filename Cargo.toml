@@ -3,6 +3,7 @@ name = "nortui"
 version = "0.1.0"
 edition = "2024"
 description = "A small searchable terminal widget for the NordVPN CLI"
+license = "MIT"
 
 [dependencies]
 anyhow = "1"
