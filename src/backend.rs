@@ -926,7 +926,7 @@ esac
             parse_locations("New_York    Salt_Lake_City\n\x1b[34mSão_Paulo\x1b[0m\n").unwrap(),
             expected
         );
-        assert!(parse_locations("\n\t\n").unwrap().is_empty());
+        assert_eq!(parse_locations("\n\t\n").unwrap(), Vec::<String>::new());
         assert!(parse_locations("Please log in.").is_err());
         assert!(parse_locations("--help").is_err());
     }
@@ -1101,13 +1101,9 @@ esac
             ["New_York", "Salt_Lake_City"]
         );
         fixture.mark("no-cities");
-        assert!(
-            fixture
-                .backend
-                .cities("United_States")
-                .await
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            fixture.backend.cities("United_States").await.unwrap(),
+            Vec::<String>::new()
         );
         fs::remove_file(fixture.directory.path().join("no-cities")).unwrap();
         fixture.mark("fail-cities");

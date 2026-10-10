@@ -367,7 +367,7 @@ mod tests {
 
         assert!(catalog.set_countries(&["Japan".into(), "United_States".into()]));
         assert_eq!(catalog.countries["United_States"], ["New_York", "Seattle"]);
-        assert!(catalog.countries["Japan"].is_empty());
+        assert_eq!(catalog.countries["Japan"], Vec::<String>::new());
         assert!(catalog.set_countries(&["Japan".into()]));
         assert!(!catalog.countries.contains_key("United_States"));
     }

@@ -1631,7 +1631,7 @@ mod tests {
         app.open_search();
         app.paste("new york");
         assert_eq!(app.results.len(), 1);
-        assert!(!app.results[0].matches.is_empty());
+        assert_ne!(app.results[0].matches, Vec::<u32>::new());
         assert_eq!(
             app.handle_key(key(KeyCode::Enter)),
             Input::Execute(Action::Connect(Some(Location {
@@ -1640,7 +1640,7 @@ mod tests {
             })))
         );
         assert_eq!(app.mode, Mode::Panel);
-        assert!(app.query.is_empty());
+        assert_eq!(app.query, "");
         assert!(app.results.is_empty());
     }
 
@@ -1654,7 +1654,7 @@ mod tests {
         assert_eq!(app.query, "cdsrqi/");
         assert_eq!(app.handle_key(key(KeyCode::Esc)), Input::None);
         assert_eq!(app.mode, Mode::Panel);
-        assert!(app.query.is_empty());
+        assert_eq!(app.query, "");
         assert_eq!(app.handle_key(key(KeyCode::Char('q'))), Input::Exit);
         app.open_search();
         assert_eq!(app.handle_key(key(KeyCode::Esc)), Input::None);
@@ -1676,17 +1676,17 @@ mod tests {
         assert_eq!(app.mode, Mode::Panel);
         assert!(app.results.is_empty());
         app.paste("s");
-        assert!(app.query.is_empty());
+        assert_eq!(app.query, "");
         for trigger in ['i', '/'] {
             assert_eq!(app.handle_key(key(KeyCode::Char(trigger))), Input::None);
             assert_eq!(app.mode, Mode::Search);
-            assert!(app.query.is_empty());
+            assert_eq!(app.query, "");
             assert_eq!(app.results.len(), 2);
             assert_eq!(app.results[0].kind, ItemKind::Country);
             assert_eq!(app.results[1].kind, ItemKind::City);
             app.paste("japan");
             app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-            assert!(app.query.is_empty());
+            assert_eq!(app.query, "");
             assert_eq!(app.results.len(), 2);
             app.handle_key(key(KeyCode::Esc));
             assert!(app.results.is_empty());
@@ -1716,7 +1716,7 @@ mod tests {
         assert_eq!(app.selected, 0);
         app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
         assert_eq!(app.selected, 0);
-        assert!(app.query.is_empty());
+        assert_eq!(app.query, "");
     }
 
     #[test]
@@ -1801,7 +1801,7 @@ mod tests {
             );
         }
         assert_eq!(app.mode, Mode::Panel);
-        assert!(app.query.is_empty());
+        assert_eq!(app.query, "");
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             Input::Exit
@@ -1835,7 +1835,7 @@ mod tests {
         app.paste("e\u{301}\n\u{1b}");
         assert_eq!(app.query, "e\u{301}");
         app.handle_key(key(KeyCode::Backspace));
-        assert!(app.query.is_empty());
+        assert_eq!(app.query, "");
     }
 
     #[test]
@@ -1852,7 +1852,7 @@ mod tests {
             assert_eq!(app.mode, Mode::Help);
         }
         app.paste("ignored");
-        assert!(app.query.is_empty());
+        assert_eq!(app.query, "");
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
             Input::Execute(Action::Refresh)
@@ -1912,12 +1912,12 @@ mod tests {
         app.paste("y\n\u{1b}");
         assert_eq!(app.query, "Tokyo");
         app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-        assert!(app.query.is_empty());
+        assert_eq!(app.query, "");
         assert_eq!(app.query_cursor(), 0);
         app.handle_key(key(KeyCode::Left));
         app.handle_key(key(KeyCode::Right));
         app.handle_key(key(KeyCode::Backspace));
-        assert!(app.query.is_empty());
+        assert_eq!(app.query, "");
     }
 
     #[test]
@@ -1931,7 +1931,7 @@ mod tests {
         assert_eq!(app.query, "👩‍💻");
         assert_eq!(app.query_cursor(), app.query.len());
         app.handle_key(key(KeyCode::Backspace));
-        assert!(app.query.is_empty());
+        assert_eq!(app.query, "");
 
         app.paste("東京");
         app.handle_key(key(KeyCode::Left));
@@ -1943,7 +1943,7 @@ mod tests {
         app.query = "e\u{301}".into();
         assert_eq!(app.query_cursor(), app.query.len());
         app.handle_key(key(KeyCode::Backspace));
-        assert!(app.query.is_empty());
+        assert_eq!(app.query, "");
     }
 
     #[test]
@@ -2226,11 +2226,13 @@ mod tests {
         });
         app.set_notice("Refreshing status…", false);
         assert!(!app.is_working());
-        app.notice.as_mut().unwrap().created = Instant::now() - Duration::from_secs(4);
+        app.notice.as_mut().unwrap().created =
+            Instant::now().checked_sub(Duration::from_secs(4)).unwrap();
         app.expire_notice();
         assert!(app.notice.is_none());
         app.set_notice("An error", true);
-        app.notice.as_mut().unwrap().created = Instant::now() - Duration::from_secs(4);
+        app.notice.as_mut().unwrap().created =
+            Instant::now().checked_sub(Duration::from_secs(4)).unwrap();
         app.expire_notice();
         assert!(app.notice.as_ref().unwrap().is_error);
     }
@@ -2278,7 +2280,8 @@ mod tests {
         });
         controller.execute(Action::Refresh);
         controller.app.set_notice("Temporary notice", false);
-        controller.app.notice.as_mut().unwrap().created = Instant::now() - Duration::from_secs(4);
+        controller.app.notice.as_mut().unwrap().created =
+            Instant::now().checked_sub(Duration::from_secs(4)).unwrap();
         controller.app.expire_notice();
         assert!(controller.app.notice.is_none());
         assert!(controller.app.is_refreshing());

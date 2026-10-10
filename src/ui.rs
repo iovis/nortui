@@ -757,7 +757,7 @@ mod tests {
             row_text(&terminal, hero_y + 1).trim_end(),
             "  United States"
         );
-        assert!(row_text(&terminal, hero_y + 2).trim().is_empty());
+        assert_eq!(row_text(&terminal, hero_y + 2).trim(), "");
         assert_eq!(
             row_text(&terminal, hero_y + 3).trim_end(),
             "  VPN IP      192.0.2.100"
@@ -817,7 +817,7 @@ mod tests {
         assert!(buffer.content().iter().all(|cell| cell.bg == Color::Reset));
         assert!(row_text(&terminal, 10).starts_with('─'));
         assert!(row_text(&terminal, 11).ends_with("⦁ Connected "));
-        assert!(row_text(&terminal, 11)[..66].trim().is_empty());
+        assert_eq!(row_text(&terminal, 11)[..66].trim(), "");
         assert!(!terminal.backend().cursor_visible());
     }
 
@@ -864,7 +864,7 @@ mod tests {
             ] {
                 let row = row_text(&terminal, row);
                 if value.is_empty() {
-                    assert!(row.trim().is_empty());
+                    assert_eq!(row.trim(), "");
                 } else {
                     assert_eq!(row.trim_end(), format!("  {label:<10}  {value}"));
                 }
@@ -889,7 +889,7 @@ mod tests {
             assert_eq!(row_containing(&terminal, "Uptime"), 8);
             assert_eq!(row_containing(&terminal, "Transfer"), 9);
             if server.is_none() {
-                assert!(row_text(&terminal, 5).trim().is_empty());
+                assert_eq!(row_text(&terminal, 5).trim(), "");
             }
             if technology.is_none() && protocol.is_some() {
                 assert_eq!(row_text(&terminal, 6).trim_end(), "  Technology  UDP");
@@ -1117,7 +1117,7 @@ mod tests {
         assert_eq!(row_containing(&tall, "New York"), 4);
         app.open_search();
         let mut search = terminal(&mut app, 80, 12);
-        assert!(row_text(&search, 0).trim().is_empty());
+        assert_eq!(row_text(&search, 0).trim(), "");
         assert_eq!(search.backend().buffer()[(2, 1)].symbol(), "›");
         assert_eq!(search.backend().buffer()[(2, 1)].fg, BLUE);
         search.backend_mut().assert_cursor_position((4, 1));
@@ -1330,7 +1330,7 @@ mod tests {
                     assert_eq!(buffer[(2, 11)].fg, GRAY);
                     assert!(footer.contains('…'));
                 } else {
-                    assert!(footer[..usize::from(circle_x)].trim().is_empty());
+                    assert_eq!(footer[..usize::from(circle_x)].trim(), "");
                 }
                 assert!(!footer.contains("Japan"));
             }
@@ -1436,7 +1436,7 @@ mod tests {
         let mut app = App::new(Vec::new());
         app.set_snapshot(connected());
         let normal = terminal(&mut app, 80, 12);
-        assert!(row_text(&normal, 9).trim().is_empty());
+        assert_eq!(row_text(&normal, 9).trim(), "");
         app.busy = Some(Action::Refresh);
         app.set_notice("Cannot read the connection\nPlease retry", true);
         let error = terminal(&mut app, 80, 12);
@@ -1455,7 +1455,7 @@ mod tests {
         app.notice = None;
         let cleared = terminal(&mut app, 80, 12);
         assert!(!text(&cleared).contains("Cannot read"));
-        assert!(row_text(&cleared, 9).trim().is_empty());
+        assert_eq!(row_text(&cleared, 9).trim(), "");
     }
 
     #[test]
@@ -1523,7 +1523,7 @@ mod tests {
         let mut app = App::new(Vec::new());
         let mut terminal = terminal(&mut app, 80, 12);
         for row in 0..10 {
-            assert!(row_text(&terminal, row).trim().is_empty());
+            assert_eq!(row_text(&terminal, row).trim(), "");
         }
         assert!(SPINNER_FRAMES.contains(&terminal.backend().buffer()[(2, 11)].symbol()));
         assert_eq!(terminal.backend().buffer()[(2, 11)].fg, GRAY);
@@ -1538,7 +1538,7 @@ mod tests {
         });
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         for row in 0..10 {
-            assert!(row_text(&terminal, row).trim().is_empty());
+            assert_eq!(row_text(&terminal, row).trim(), "");
         }
         assert!(row_text(&terminal, 11).contains("Starting service…"));
         assert_eq!(terminal.backend().buffer()[(4, 11)].fg, GRAY);
